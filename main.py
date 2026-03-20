@@ -5,7 +5,7 @@ Støtter: norsk, nynorsk, engelsk, spansk, tysk, portugisisk, fransk.
 """
 
 import re
-import os
+import random
 from datetime import date, timedelta
 from typing import Optional
 import requests
@@ -55,6 +55,42 @@ def get_id(resp: dict) -> Optional[int]:
         return resp["value"]["id"]
     except (KeyError, TypeError):
         return None
+
+
+def find_or_create_customer(name: str, base_url: str, auth: tuple,
+                             org_nr: Optional[str] = None,
+                             email: Optional[str] = None) -> Optional[int]:
+    """Søk etter kunde, opprett hvis ikke funnet."""
+    r = tx("GET", "/customer", base_url, auth,
+           params={"name": name, "fields": "id,name", "count": 5})
+    values = r.get("values", [])
+    if values:
+        return values[0]["id"]
+    body: dict = {"name": name, "isCustomer": True}
+    if org_nr:
+        body["organizationNumber"] = org_nr
+    if email:
+        body["email"] = email
+    r = tx("POST", "/customer", base_url, auth, body)
+    return get_id(r)
+
+
+def find_or_create_product(name: str, base_url: str, auth: tuple,
+                            price: Optional[float] = None,
+                            prod_nr: Optional[str] = None) -> Optional[int]:
+    """Søk etter produkt, opprett hvis ikke funnet."""
+    r = tx("GET", "/product", base_url, auth,
+           params={"name": name, "fields": "id,name", "count": 5})
+    values = r.get("values", [])
+    if values:
+        return values[0]["id"]
+    body: dict = {"name": name}
+    if price is not None:
+        body["priceExcludingVatCurrency"] = price
+    if prod_nr:
+        body["productNumber"] = prod_nr
+    r = tx("POST", "/product", base_url, auth, body)
+    return get_id(r)
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +143,14 @@ def extract_price(text: str) -> Optional[float]:
             return float(raw)
         except ValueError:
             pass
+    # "til X kr/NOK" (Norwegian order price)
+    m = re.search(r'til\s+(\d[\d\s]*[.,]?\d*)\s*(?:kr|NOK)', text, re.IGNORECASE)
+    if m:
+        raw = m.group(1).replace(' ', '').replace(',', '.')
+        try:
+            return float(raw)
+        except ValueError:
+            pass
     return None
 
 
@@ -130,7 +174,6 @@ def extract_department_number(text: str) -> Optional[str]:
     )
     if m:
         return m.group(1)
-    # "mit Abteilungsnummer 42"
     m = re.search(r'(?:mit|with|med)\s+\w*nummer\s+(\d+)', text, re.IGNORECASE)
     if m:
         return m.group(1)
@@ -139,7 +182,6 @@ def extract_department_number(text: str) -> Optional[str]:
 
 def extract_name(text: str) -> tuple:
     """Extract (firstName, lastName) from multilingual prompts."""
-    # Multilingual trigger words
     m = re.search(
         r'(?:med\s+navn|med\s+namn|named?\s*(?:is\s*)?|called?\s*(?:is\s*)?|namens|'
         r'llamad[oa]|appel[eé][e]?|com\s+nome|nommé[e]?|mit\s+namen)\s+'
@@ -150,7 +192,6 @@ def extract_name(text: str) -> tuple:
         parts = m.group(1).split()
         return " ".join(parts[:-1]), parts[-1]
 
-    # Quoted full name
     m = re.search(
         r'["\']([A-ZÆØÅ][a-zæøå]+(?:\s+[A-ZÆØÅ][a-zæøå]+)+)["\']', text
     )
@@ -158,12 +199,11 @@ def extract_name(text: str) -> tuple:
         parts = m.group(1).split()
         return " ".join(parts[:-1]), parts[-1]
 
-    # Fallback: two consecutive capitalised words not in stop list
     STOP = {
         'Opprett', 'Create', 'Crea', 'Erstelle', 'Créez', 'En', 'Et', 'Ein', 'Eit',
         'Une', 'Un', 'Nuevo', 'Nueva', 'Neue', 'Ansatt', 'Employee', 'Kunde',
         'Customer', 'Med', 'Named', 'With', 'Og', 'Tilsett', 'Medarbeider',
-        'Epost', 'Email', 'Telefon', 'Phone', 'Og', 'And',
+        'Epost', 'Email', 'Telefon', 'Phone', 'And',
     }
     words = [w for w in re.findall(r'\b[A-ZÆØÅ][a-zæøåéèêëàâîïôùûüç]+\b', text)
              if w not in STOP]
@@ -175,24 +215,35 @@ def extract_name(text: str) -> tuple:
 
 
 def extract_company_name(text: str) -> Optional[str]:
-    """Extract company/organisation name."""
     # Quoted name
-    m = re.search(r"['\"]([^'\"]{2,60})['\"]", text)
+    m = re.search(r'["\u201c\u201d]([^"\u201c\u201d]{2,60})["\u201c\u201d]', text)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"'([^']{2,60})'", text)
     if m:
         return m.group(1).strip()
 
     # "med navn / named / llamado / namens / appelé / called X AS"
     m = re.search(
-        r'(?:med\s+navn|named?\s*|called?\s*|namens\s*|llamad[oa]\s*|appel[eé][e]?\s*|com\s+nome\s*)\s*'
-        r'([A-ZÆØÅ0-9][\w\s&.-]{1,50}?(?:\s+AS|\s+Ltd|\s+GmbH|\s+SAS|\s+BV)?)'
-        r'(?=\s+(?:med|med|with|con|avec|mit|com)|,|\.|$)',
+        r'(?:med\s+navn|named?\s*|called?\s*|namens\s*|llamad[oa]\s*|appel[eé][e]?\s*|com\s+nome\s*|lié\s+au\s+client\s*|for\s+kunden?\s*|for\s+kunde\s*)\s*'
+        r'([A-ZÆØÅ0-9][\w\s&.-]{1,50}?(?:\s+(?:AS|Ltd|GmbH|SAS|BV|SARL|SRL|AB))?)'
+        r'(?=\s+(?:med|with|con|avec|mit|com|\()|,|\.|$)',
         text, re.IGNORECASE
     )
     if m:
         return m.group(1).strip()
 
-    # Something ending in AS / Ltd etc.
-    m = re.search(r'\b([A-ZÆØÅ][\w\s&.-]{1,40}(?:AS|Ltd|GmbH|SAS|BV))\b', text)
+    # "kunden X AS" or "cliente X AS"
+    m = re.search(
+        r'(?:kunden?|kunde|cliente|client|Kunden?)\s+'
+        r'([A-ZÆØÅ][\w\s&.-]{1,40}(?:\s+(?:AS|Ltd|GmbH|SAS|BV|SARL|SRL|AB))?)'
+        r'(?=\s|\(|,|$)',
+        text, re.IGNORECASE
+    )
+    if m:
+        return m.group(1).strip()
+
+    m = re.search(r'\b([A-ZÆØÅ][\w\s&.-]{1,40}(?:AS|Ltd|GmbH|SAS|BV|SARL|SRL|AB))\b', text)
     if m:
         return m.group(1).strip()
 
@@ -210,12 +261,31 @@ def extract_address(text: str) -> Optional[dict]:
     return None
 
 
+def extract_product_name_from_order(text: str) -> Optional[str]:
+    """Extract product name from order prompts like 'produkta X (nr) til pris'."""
+    # Norwegian: "produkta/produktet/produkt X"
+    m = re.search(
+        r'(?:produkta?|produktet|vare[nr]?|tjeneste[nr]?|service)\s+'
+        r'["\']?([A-ZÆØÅ][^"\',()\d][^"\',()\n]{1,50}?)["\']?\s*(?:\(|\d|til|à|for|,|$)',
+        text, re.IGNORECASE
+    )
+    if m:
+        return m.group(1).strip()
+    return None
+
+
 # ---------------------------------------------------------------------------
 # OPPGAVEDETEKSJON
 # ---------------------------------------------------------------------------
 
 def detect_task(prompt: str) -> str:
     p = prompt.lower()
+
+    # Ordre/bestilling (must check before invoice)
+    if any(k in p for k in ['ordre', 'bestilling', 'bestellung', 'commande', 'pedido',
+                              'encomenda', 'opprett ein ordre', 'opprett en ordre',
+                              'create an order', 'create order', 'ny ordre']):
+        return 'order'
 
     if any(k in p for k in ['faktura', 'invoice', 'rechnung', 'facture', 'factura', 'fatura']):
         return 'invoice'
@@ -242,7 +312,6 @@ def detect_task(prompt: str) -> str:
                               'trabalhador']):
         return 'employee'
 
-    # Fallback: if it has an email it's probably an employee
     if extract_email(prompt):
         return 'employee'
     return 'employee'
@@ -254,7 +323,7 @@ def is_admin(prompt: str) -> bool:
         'administrator', 'kontoadministrator', 'admin',
         'alle rettigheter', 'all privileges', 'all_privileges',
         'administrateur', 'administrador', 'administrativ',
-        'vera kontoadministrator',  # nynorsk
+        'vera kontoadministrator',
     ])
 
 
@@ -326,13 +395,11 @@ def handle_supplier(prompt: str, base_url: str, auth: tuple):
 
 
 def handle_product(prompt: str, base_url: str, auth: tuple):
-    # Quoted name is most reliable
     name = None
-    m = re.search(r"['\"]([^'\"]+)['\"]", prompt)
+    m = re.search(r"['\"\u201c\u201d]([^'\"\u201c\u201d]+)['\"\u201c\u201d]", prompt)
     if m:
         name = m.group(1)
     if not name:
-        # "appelé/llamado/named/kalt X"
         m = re.search(
             r'(?:appel[eé][e]?\s+|llamad[oa]\s+|named?\s+|kalt\s+|genannt\s+|chamad[oa]\s+)'
             r'["\']?([^"\',.]+?)["\']?(?:\s+avec|\s+with|\s+med|\s+con|\s+mit|\s+com|,|$)',
@@ -358,12 +425,10 @@ def handle_product(prompt: str, base_url: str, auth: tuple):
 
 def handle_department(prompt: str, base_url: str, auth: tuple):
     name = None
-    # Quoted name
-    m = re.search(r"['\"]([^'\"]+)['\"]", prompt)
+    m = re.search(r"['\"\u201c\u201d]([^'\"\u201c\u201d]+)['\"\u201c\u201d]", prompt)
     if m:
         name = m.group(1)
     if not name:
-        # "namens X" (German), "named/called X", "kalt X", "appelé X"
         m = re.search(
             r'(?:namens|named?\s*|called?\s*|kalt\s*|appel[eé][e]?\s*|llamad[oa]\s*)\s*'
             r'["\']?([A-ZÆØÅ][^"\',.]+?)["\']?'
@@ -377,42 +442,68 @@ def handle_department(prompt: str, base_url: str, auth: tuple):
 
     dept_nr = extract_department_number(prompt)
     if not dept_nr:
-        dept_nr = "1"
+        dept_nr = str(random.randint(10, 99))
 
     body: dict = {"name": name, "departmentNumber": dept_nr}
     print(f"  Oppretter avdeling: {name}, nr={dept_nr}")
     tx("POST", "/department", base_url, auth, body)
 
 
+def handle_order(prompt: str, base_url: str, auth: tuple):
+    """Opprett ordre: finn/opprett kunde og produkt, opprett ordre med linjer."""
+    today = date.today().isoformat()
+
+    # Finn/opprett kunde
+    company = extract_company_name(prompt)
+    org_nr = extract_org_number(prompt)
+    email = extract_email(prompt)
+    customer_id = find_or_create_customer(
+        company or "Kunde", base_url, auth, org_nr=org_nr, email=email
+    )
+    if not customer_id:
+        print("  Kunne ikke hente/opprette kunde")
+        return
+
+    # Finn produkt og pris
+    price = extract_price(prompt)
+    prod_name = extract_product_name_from_order(prompt)
+    prod_nr = extract_product_number(prompt)
+
+    order_lines = []
+    if prod_name:
+        product_id = find_or_create_product(prod_name, base_url, auth,
+                                            price=price, prod_nr=prod_nr)
+        if product_id:
+            line: dict = {"product": {"id": product_id}, "count": 1.0}
+            if price is not None:
+                line["unitPriceExcludingVatCurrency"] = price
+            order_lines.append(line)
+
+    body: dict = {
+        "customer": {"id": customer_id},
+        "orderDate": today,
+    }
+    if order_lines:
+        body["orderLines"] = order_lines
+
+    print(f"  Oppretter ordre for kunde {customer_id}")
+    tx("POST", "/order", base_url, auth, body)
+
+
 def handle_invoice(prompt: str, base_url: str, auth: tuple):
     today = date.today().isoformat()
     due = (date.today() + timedelta(days=30)).isoformat()
 
-    # Finn eller opprett kunde
     company = extract_company_name(prompt)
-    customer_id = None
-
-    if company:
-        r = tx("GET", "/customer", base_url, auth,
-               params={"name": company, "fields": "id,name", "count": 5})
-        values = r.get("values", [])
-        if values:
-            customer_id = values[0]["id"]
-
+    org_nr = extract_org_number(prompt)
+    email = extract_email(prompt)
+    customer_id = find_or_create_customer(
+        company or "Fakturakunde", base_url, auth, org_nr=org_nr, email=email
+    )
     if not customer_id:
-        cname = company or "Fakturakunde"
-        email = extract_email(prompt)
-        cbody: dict = {"name": cname, "isCustomer": True}
-        if email:
-            cbody["email"] = email
-        r = tx("POST", "/customer", base_url, auth, cbody)
-        customer_id = get_id(r)
-
-    if not customer_id:
-        print("  Kunne ikke hente kunde-ID")
+        print("  Kunne ikke hente/opprette kunde")
         return
 
-    # Opprett ordre
     r = tx("POST", "/order", base_url, auth, {
         "customer": {"id": customer_id},
         "orderDate": today,
@@ -422,7 +513,6 @@ def handle_invoice(prompt: str, base_url: str, auth: tuple):
         print("  Kunne ikke hente ordre-ID")
         return
 
-    # Opprett faktura
     tx("POST", "/invoice", base_url, auth, {
         "invoiceDate": today,
         "invoiceDueDate": due,
@@ -441,7 +531,7 @@ def handle_travel_expense(prompt: str, base_url: str, auth: tuple):
     if values:
         emp_id = values[0]["id"]
     if not emp_id:
-        print("  Ingen ansatt funnet for reiseregning")
+        print("  Ingen ansatt funnet")
         return
 
     body: dict = {
@@ -449,7 +539,7 @@ def handle_travel_expense(prompt: str, base_url: str, auth: tuple):
         "travelDetails": {"departureDate": today},
     }
     m = re.search(
-        r'(?:beskrivelse|description|Beschreibung|description)\s*[:\s]+([^,.]+)',
+        r'(?:beskrivelse|description|Beschreibung)\s*[:\s]+([^,.]+)',
         prompt, re.IGNORECASE
     )
     if m:
@@ -461,10 +551,15 @@ def handle_travel_expense(prompt: str, base_url: str, auth: tuple):
 def handle_project(prompt: str, base_url: str, auth: tuple):
     today = date.today().isoformat()
 
+    # Prosjektnavn
     name = None
-    m = re.search(r"['\"]([^'\"]+)['\"]", prompt)
+    m = re.search(r'["\u201c\u201d]([^"\u201c\u201d]+)["\u201c\u201d]', prompt)
     if m:
         name = m.group(1)
+    if not name:
+        m = re.search(r"'([^']+)'", prompt)
+        if m:
+            name = m.group(1)
     if not name:
         m = re.search(
             r'(?:prosjekt|project|projekt|projet|proyecto|projeto)\s+'
@@ -477,19 +572,27 @@ def handle_project(prompt: str, base_url: str, auth: tuple):
     if not name:
         name = "Prosjekt"
 
-    # Hent første kunde
-    r = tx("GET", "/customer", base_url, auth,
-           params={"fields": "id,name", "count": 1})
+    # Finn/opprett kunde fra prompten
+    company = extract_company_name(prompt)
+    org_nr = extract_org_number(prompt)
     customer_id = None
-    values = r.get("values", [])
-    if values:
-        customer_id = values[0]["id"]
+    if company:
+        customer_id = find_or_create_customer(company, base_url, auth, org_nr=org_nr)
+    if not customer_id:
+        r = tx("GET", "/customer", base_url, auth,
+               params={"fields": "id,name", "count": 1})
+        values = r.get("values", [])
+        if values:
+            customer_id = values[0]["id"]
     if not customer_id:
         r = tx("POST", "/customer", base_url, auth,
                {"name": "Prosjektkunde AS", "isCustomer": True})
         customer_id = get_id(r)
 
-    body: dict = {"name": name, "number": "1", "startDate": today}
+    # Unikt prosjektnummer
+    proj_nr = str(random.randint(1000, 9999))
+
+    body: dict = {"name": name, "number": proj_nr, "startDate": today}
     if customer_id:
         body["customer"] = {"id": customer_id}
 
@@ -515,7 +618,8 @@ async def solve(request_body: dict):
         session_token: str = creds.get("session_token", "")
         auth = ("0", session_token)
 
-        print(f"\n=== OPPGAVE ===\n{prompt[:200]}")
+        print(f"\n=== OPPGAVE ===\n{prompt}")
+        print(f"  Base URL: {base_url}")
 
         task = detect_task(prompt)
         print(f"  → Detektert: {task}")
@@ -530,6 +634,8 @@ async def solve(request_body: dict):
             handle_product(prompt, base_url, auth)
         elif task == "department":
             handle_department(prompt, base_url, auth)
+        elif task == "order":
+            handle_order(prompt, base_url, auth)
         elif task == "invoice":
             handle_invoice(prompt, base_url, auth)
         elif task == "travel_expense":
