@@ -1,241 +1,504 @@
 """
 NM i AI 2026 – Tripletex Agent
-FastAPI + agentic loop med Claude tool_use.
+Regelbasert agent – ingen API-nøkkel nødvendig.
+Støtter: norsk, nynorsk, engelsk, spansk, tysk, portugisisk, fransk.
 """
 
-import json
+import re
 import os
-import base64
+from datetime import date, timedelta
 from typing import Optional
 import requests
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-import anthropic
 
 app = FastAPI()
 
-# ---------------------------------------------------------------------------
-# SYSTEM PROMPT
-# ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """Du er en ekspert Tripletex regnskaps-API-agent som konkurrerer i NM i AI 2026.
-Oppgaver kan komme på norsk bokmål, nynorsk, engelsk, spansk, tysk, portugisisk eller fransk.
-
-## KRITISKE REGLER (følg disse nøyaktig!)
-1. Endepunkter starter med /employee, /customer, /invoice osv. – ALDRI /v2/employee
-2. Bruk alltid ID fra POST-respons direkte i neste kall – ALDRI GET for å finne IDer du allerede har
-3. Minimer API-kall – gjør alt i færrest mulige kall
-4. Unngå 4xx-feil – bruk korrekte påkrevde felt fra referansen nedenfor
-5. Utfør kall i riktig rekkefølge (avhengigheter først)
-6. Dagens dato: 2026-03-20
-7. Ved PUT: inkluder alltid "id"-feltet i body-en i tillegg til feltene du oppdaterer
-
-## SCORINGSSTRATEGI
-- Korrekthet (0-1): Felt-for-felt verifisering av opprettede/endrede oppføringer
-- Effektivitetsbonus: Færre API-kall = høyere bonus (KUN ved perfekt korrekthet)
-- Feilavtrekk: Hvert 4xx-svar reduserer effektivitetsbonusen
-- Administrator-rolle for ansatt: Alene verdt 5 av 10 poeng – ALLTID sett hvis nevnt
-
-## ENDEPUNKT-REFERANSE (base_url er allerede /v2 – bruk IKKE /v2/ prefix)
-
-### ANSATT (employee)
-
-⭐ NAVNEPARSING (KRITISK): "Fornavn Etternavn" → firstName="Fornavn", lastName="Etternavn"
-  Eksempel: "Kari Nordmann" → firstName="Kari", lastName="Nordmann"
-  Eksempel: "Ole Martin Hansen" → firstName="Ole Martin", lastName="Hansen"
-  ALDRI sett hele navnet i firstName. ALDRI la lastName stå tom.
-
-Opprett: POST /employee
-  Påkrevd: firstName (fornavn), lastName (etternavn)
-  Valgfritt: email, phoneNumberMobile, employeeNumber, dateOfBirth (YYYY-MM-DD)
-  Svar: {"value": {"id": 123, "firstName": "Kari", "lastName": "Nordmann", ...}}
-  OBS: email-feltet heter "email" (ikke emailAddress)
-
-⭐ ADMINISTRATOR (5/10 poeng – KRITISK):
-  Når prompten sier "administrator", "kontoadministrator", "admin" eller lignende:
-  Steg 1 – POST /employee med alle felt:
-    {"firstName": "Kari", "lastName": "Nordmann", "email": "kari@example.org"}
-  Steg 2 – PUT /employee/entitlement/:grantEntitlementsByTemplate med query-parametere:
-    method=PUT, endpoint=/employee/entitlement/:grantEntitlementsByTemplate
-    params={"employeeId": <id fra steg 1>, "template": "ALL_PRIVILEGES"}
-    (ingen body nødvendig)
-
-  ⚠️ IKKE bruk "administrator: true" i PUT /employee – det feltet finnes ikke!
-  ⚠️ Bruk ALLTID entitlement-endepunktet for administrator-rolle!
-
-Oppdater ansatt: PUT /employee/{id}
-  Body: {"id": {id}, firstName, lastName, email, ...alle felt som skal beholdes + felt som oppdateres}
-  OBS: PUT er full-replace – inkluder ALLE felt du vil beholde!
-
-Ansatt med ansattnummer: inkluder employeeNumber (streng) i POST-body
-
-### KUNDE (customer)
-Opprett: POST /customer
-  Påkrevd: name, isCustomer: true
-  Valgfritt: email, phoneNumber, organizationNumber, invoiceEmail,
-             physicalAddress.addressLine1, physicalAddress.city,
-             physicalAddress.postalCode, physicalAddress.country.id
-  Svar: {"value": {"id": 456}}
-  OBS: Norsk adresse: bruk physicalAddress, land Norge = {"country": {"id": 1}}
-
-### LEVERANDØR (supplier)
-Opprett: POST /supplier
-  Påkrevd: name, isSupplier: true
-  Valgfritt: email, organizationNumber, phoneNumber, bankAccounts (liste)
-  Svar: {"value": {"id": ...}}
-
-### PRODUKT (product)
-Opprett: POST /product
-  Påkrevd: name
-  Valgfritt: priceExcludingVatCurrency (tall), costExcludingVatCurrency,
-             productNumber, unit.id, vatType.id, description
-  Svar: {"value": {"id": 789}}
-
-### ORDRE (order)
-Opprett: POST /order
-  Påkrevd: customer.id, orderDate (YYYY-MM-DD)
-  Valgfritt: deliveryDate, orderComment, currency.id
-  Svar: {"value": {"id": 101}}
-  OBS: orderLines kan inkluderes direkte i POST-body:
-  "orderLines": [{"product": {"id": X}, "count": 1.0, "unitPriceExcludingVatCurrency": 999.0, "description": "..."}]
-
-Legg til ordrelinje: POST /orderline
-  Påkrevd: order.id, count
-  Valgfritt: product.id, unitPriceExcludingVatCurrency, description, discount
-
-### FAKTURA (invoice)
-Opprett fra ordre: POST /invoice
-  Påkrevd: invoiceDate (YYYY-MM-DD), customer.id, orders: [{"id": ordre_id}]
-  Valgfritt: invoiceDueDate (YYYY-MM-DD, standard 30 dager), comment, sendType
-  Svar: {"value": {"id": 201}}
-  OBS: Forfall: 30 dager etter fakturadato hvis ikke spesifisert
-
-Send faktura e-post: PUT /invoice/{id}/:send?sendType=EMAIL
-  Alternativt: sendType=EHF, EFAKTURA, AVTALEGIRO, VIPPS
-
-### PROSJEKT (project)
-Opprett: POST /project
-  Påkrevd: name, number (streng, f.eks. "1"), startDate (YYYY-MM-DD), customer.id
-  Valgfritt: endDate, projectManager.id, description
-  Svar: {"value": {"id": 301}}
-
-### AVDELING (department)
-Opprett: POST /department
-  Påkrevd: name, departmentNumber (streng f.eks. "1")
-  Valgfritt: manager.id
-  Svar: {"value": {"id": 401}}
-
-### REISEREGNING (travelExpense)
-Opprett: POST /travelExpense
-  Påkrevd: employee.id, travelDetails.departureDate (YYYY-MM-DD)
-  Valgfritt: description, project.id, travelDetails.returnDate
-  Svar: {"value": {"id": ...}}
-
-### KONTAKTPERSON (contact)
-Opprett: POST /contact
-  Påkrevd: firstName, lastName, customer.id
-  Valgfritt: email, phoneNumber
-
-### BILAG (voucher)
-Opprett: POST /ledger/voucher
-  Påkrevd: date (YYYY-MM-DD), description, voucherType.id
-  Svar: {"value": {"id": ...}}
-
-### SØK (bruk KUN når du ikke har ID fra tidligere respons)
-Finn ansatte: GET /employee?firstName=X&lastName=Y&fields=id,firstName,lastName
-Finn kunder: GET /customer?name=X&fields=id,name,email&count=10
-Finn produkter: GET /product?name=X&fields=id,name&count=10
-Liste-svar format: {"fullResultSize": N, "values": [...]}
-
-## NORSK → API-OVERSETTELSE
-- ansatt/medarbeider = employee      | fornavn = firstName
-- kunde = customer                   | etternavn = lastName
-- faktura = invoice                  | navn = name
-- produkt/vare = product             | e-post/epost = email
-- ordre/bestilling = order           | telefon = phoneNumberMobile
-- prosjekt = project                 | pris (eks.mva) = priceExcludingVatCurrency
-- avdeling = department              | antall = count
-- leverandør = supplier              | dato = date
-- reiseregning = travelExpense       | beskrivelse = description
-- kontaktperson = contact            | organisasjonsnummer = organizationNumber
-- bilag = voucher                    | administrator = entitlement ALL_PRIVILEGES
-- fakturadato = invoiceDate          | forfallsdato = invoiceDueDate
-- bestillingsnummer = orderNumber    | produktnummer = productNumber
-
-## FELTFORMAT
-- Datoer: alltid YYYY-MM-DD
-- Forfall (faktura): 30 dager etter fakturadato hvis ikke spesifisert
-- Pris: desimaltall uten valutasymbol (f.eks. 1500.00)
-- Nested objekt med ID: {"customer": {"id": 123}} – ikke customer_id: 123
-- PUT body: inkluder alltid "id" feltet
-
-## FEILHÅNDTERING
-- 422: Les error.validationMessages – det forteller hvilket felt som mangler
-- 404: Sjekk at endepunktet er korrekt (ikke /v2/employee, bare /employee)
-- 401: Autentiseringsfeil – sjekk credentials
-- Hvis kall feiler, les feilmeldingen nøye og korriger i neste forsøk
-
-Kall tripletex_api-verktøyet for hvert API-kall. Les responsen nøye og bruk ID-en direkte i neste kall.
-"""
 
 # ---------------------------------------------------------------------------
-# TRIPLETEX API-KALL
+# TRIPLETEX API
 # ---------------------------------------------------------------------------
 
-def make_tripletex_call(
-    method: str,
-    endpoint: str,
-    base_url: str,
-    auth: tuple,
-    data: Optional[dict] = None,
-    params: Optional[dict] = None,
-) -> dict:
-    """Utfør ett API-kall mot Tripletex og returner responsen."""
+def tx(method: str, endpoint: str, base_url: str, auth: tuple,
+       data: Optional[dict] = None, params: Optional[dict] = None) -> dict:
     if endpoint.startswith("/v2/"):
         endpoint = endpoint[3:]
-
     url = base_url.rstrip("/") + endpoint
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    kwargs: dict = {"auth": auth, "timeout": 60, "headers": headers}
+    if params:
+        kwargs["params"] = params
+    m = method.upper()
+    if m == "GET":
+        resp = requests.get(url, **kwargs)
+    elif m == "POST":
+        resp = requests.post(url, json=data or {}, **kwargs)
+    elif m == "PUT":
+        resp = requests.put(url, json=data or {}, **kwargs)
+    elif m == "DELETE":
+        resp = requests.delete(url, **kwargs)
+    else:
+        return {"error": f"Unknown method: {method}"}
+
+    icon = "✓" if resp.status_code < 300 else "✗"
+    print(f"  {icon} {m} {endpoint} → {resp.status_code}")
+    if resp.status_code >= 400:
+        print(f"    Feil: {resp.text[:300]}")
     try:
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        kwargs: dict = {"auth": auth, "timeout": 60, "headers": headers}
-        if params:
-            kwargs["params"] = params
+        return resp.json()
+    except Exception:
+        return {"status_code": resp.status_code, "text": resp.text[:200]}
 
-        method = method.upper()
-        if method == "GET":
-            resp = requests.get(url, **kwargs)
-        elif method == "POST":
-            resp = requests.post(url, json=data or {}, **kwargs)
-        elif method == "PUT":
-            resp = requests.put(url, json=data or {}, **kwargs)
-        elif method == "DELETE":
-            resp = requests.delete(url, **kwargs)
-        else:
-            return {"error": f"Ukjent metode: {method}"}
 
-        try:
-            result = resp.json()
-        except Exception:
-            result = {"status_code": resp.status_code, "text": resp.text[:500]}
-
-        if isinstance(result, dict):
-            result["_http_status"] = resp.status_code
-        else:
-            result = {"data": result, "_http_status": resp.status_code}
-
-        status_icon = "✓" if resp.status_code < 300 else "✗"
-        print(f"  {status_icon} {method} {endpoint} → {resp.status_code}")
-        if resp.status_code >= 400:
-            print(f"    Feil: {resp.text[:300]}")
-
-        return result
-
-    except Exception as exc:
-        print(f"  FEIL ved {method} {endpoint}: {exc}")
-        return {"error": str(exc)}
+def get_id(resp: dict) -> Optional[int]:
+    try:
+        return resp["value"]["id"]
+    except (KeyError, TypeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
-# FASTAPI-RUTER
+# TEKSTUTREKK
+# ---------------------------------------------------------------------------
+
+def extract_email(text: str) -> Optional[str]:
+    m = re.search(r'[\w.+-]+@[\w.-]+\.\w+', text)
+    return m.group() if m else None
+
+
+def extract_phone(text: str) -> Optional[str]:
+    m = re.search(r'\b([49]\d{7})\b', text)
+    return m.group() if m else None
+
+
+def extract_org_number(text: str) -> Optional[str]:
+    m = re.search(r'\b(\d{9})\b', text)
+    return m.group() if m else None
+
+
+def extract_price(text: str) -> Optional[float]:
+    # "1500.00 kroner/kr/NOK/couronnes/coronas"
+    m = re.search(
+        r'(\d[\d\s]*[.,]?\d*)\s*(?:kroner?|kr\.?|NOK|couronnes?|coronas?|coroas?|crowns?)',
+        text, re.IGNORECASE
+    )
+    if m:
+        raw = m.group(1).replace(' ', '').replace(',', '.')
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    # "pris/price/prix/precio/preis/preço X"
+    m = re.search(
+        r'(?:pris|price|prix|precio|preis|preço)\s+(?:på\s+)?(\d[\d\s]*[.,]?\d*)',
+        text, re.IGNORECASE
+    )
+    if m:
+        raw = m.group(1).replace(' ', '').replace(',', '.')
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    # "de X couronnes" (French)
+    m = re.search(r'de\s+(\d[\d\s]*[.,]?\d*)\s+couronnes', text, re.IGNORECASE)
+    if m:
+        raw = m.group(1).replace(' ', '').replace(',', '.')
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return None
+
+
+def extract_product_number(text: str) -> Optional[str]:
+    m = re.search(
+        r'(?:produktnummer|product\s*number|numéro\s*produit|número\s*(?:de\s*)?producto|produktnummer)\s*[:\s]*(P?\d+)',
+        text, re.IGNORECASE
+    )
+    if m:
+        return m.group(1)
+    m = re.search(r'\b(P\d{2,})\b', text)
+    if m:
+        return m.group(1)
+    return None
+
+
+def extract_department_number(text: str) -> Optional[str]:
+    m = re.search(
+        r'(?:avdelingsnummer|abteilungsnummer|department\s*number|numéro\s*(?:de\s*)?(?:département|service)|número\s*(?:de\s*)?departamento)\s*[:\s]*(\d+)',
+        text, re.IGNORECASE
+    )
+    if m:
+        return m.group(1)
+    # "mit Abteilungsnummer 42"
+    m = re.search(r'(?:mit|with|med)\s+\w*nummer\s+(\d+)', text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return None
+
+
+def extract_name(text: str) -> tuple:
+    """Extract (firstName, lastName) from multilingual prompts."""
+    # Multilingual trigger words
+    m = re.search(
+        r'(?:med\s+navn|med\s+namn|named?\s*(?:is\s*)?|called?\s*(?:is\s*)?|namens|'
+        r'llamad[oa]|appel[eé][e]?|com\s+nome|nommé[e]?|mit\s+namen)\s+'
+        r'([A-ZÆØÅ][a-zæøåéèêëàâîïôùûüç]+(?:\s+[A-ZÆØÅ][a-zæøåéèêëàâîïôùûüç]+)+)',
+        text, re.IGNORECASE
+    )
+    if m:
+        parts = m.group(1).split()
+        return " ".join(parts[:-1]), parts[-1]
+
+    # Quoted full name
+    m = re.search(
+        r'["\']([A-ZÆØÅ][a-zæøå]+(?:\s+[A-ZÆØÅ][a-zæøå]+)+)["\']', text
+    )
+    if m:
+        parts = m.group(1).split()
+        return " ".join(parts[:-1]), parts[-1]
+
+    # Fallback: two consecutive capitalised words not in stop list
+    STOP = {
+        'Opprett', 'Create', 'Crea', 'Erstelle', 'Créez', 'En', 'Et', 'Ein', 'Eit',
+        'Une', 'Un', 'Nuevo', 'Nueva', 'Neue', 'Ansatt', 'Employee', 'Kunde',
+        'Customer', 'Med', 'Named', 'With', 'Og', 'Tilsett', 'Medarbeider',
+        'Epost', 'Email', 'Telefon', 'Phone', 'Og', 'And',
+    }
+    words = [w for w in re.findall(r'\b[A-ZÆØÅ][a-zæøåéèêëàâîïôùûüç]+\b', text)
+             if w not in STOP]
+    if len(words) >= 2:
+        return words[0], words[1]
+    if len(words) == 1:
+        return words[0], "Person"
+    return "Ukjent", "Person"
+
+
+def extract_company_name(text: str) -> Optional[str]:
+    """Extract company/organisation name."""
+    # Quoted name
+    m = re.search(r"['\"]([^'\"]{2,60})['\"]", text)
+    if m:
+        return m.group(1).strip()
+
+    # "med navn / named / llamado / namens / appelé / called X AS"
+    m = re.search(
+        r'(?:med\s+navn|named?\s*|called?\s*|namens\s*|llamad[oa]\s*|appel[eé][e]?\s*|com\s+nome\s*)\s*'
+        r'([A-ZÆØÅ0-9][\w\s&.-]{1,50}?(?:\s+AS|\s+Ltd|\s+GmbH|\s+SAS|\s+BV)?)'
+        r'(?=\s+(?:med|med|with|con|avec|mit|com)|,|\.|$)',
+        text, re.IGNORECASE
+    )
+    if m:
+        return m.group(1).strip()
+
+    # Something ending in AS / Ltd etc.
+    m = re.search(r'\b([A-ZÆØÅ][\w\s&.-]{1,40}(?:AS|Ltd|GmbH|SAS|BV))\b', text)
+    if m:
+        return m.group(1).strip()
+
+    return None
+
+
+def extract_address(text: str) -> Optional[dict]:
+    m = re.search(r'(?:adresse|address)\s+([^,]+),\s*([A-ZÆØÅa-zæøå]+)', text, re.IGNORECASE)
+    if m:
+        return {
+            "addressLine1": m.group(1).strip(),
+            "city": m.group(2).strip(),
+            "country": {"id": 1},
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
+# OPPGAVEDETEKSJON
+# ---------------------------------------------------------------------------
+
+def detect_task(prompt: str) -> str:
+    p = prompt.lower()
+
+    if any(k in p for k in ['faktura', 'invoice', 'rechnung', 'facture', 'factura', 'fatura']):
+        return 'invoice'
+    if any(k in p for k in ['reiseregning', 'travel expense', 'reiseutlegg', 'dienstreise',
+                              'note de frais', 'gasto de viaje', 'despesa de viagem']):
+        return 'travel_expense'
+    if any(k in p for k in ['avdeling', 'department', 'abteilung', 'département',
+                              'departamento', 'divisão']):
+        return 'department'
+    if any(k in p for k in ['leverandør', 'supplier', 'lieferant', 'fournisseur',
+                              'proveedor', 'fornecedor']):
+        return 'supplier'
+    if any(k in p for k in ['produkt', 'product', 'produit', 'producto', 'vare',
+                              'artikel', 'prodotto']):
+        return 'product'
+    if any(k in p for k in ['prosjekt', 'project', 'projekt', 'projet', 'proyecto',
+                              'projeto']):
+        return 'project'
+    if any(k in p for k in ['kunde', 'customer', 'client', 'klient', 'cliente',
+                              'crea un nuevo cliente', 'nouveau client']):
+        return 'customer'
+    if any(k in p for k in ['ansatt', 'employee', 'medarbeider', 'mitarbeiter',
+                              'employé', 'empleado', 'funcionário', 'tilsett',
+                              'trabalhador']):
+        return 'employee'
+
+    # Fallback: if it has an email it's probably an employee
+    if extract_email(prompt):
+        return 'employee'
+    return 'employee'
+
+
+def is_admin(prompt: str) -> bool:
+    p = prompt.lower()
+    return any(k in p for k in [
+        'administrator', 'kontoadministrator', 'admin',
+        'alle rettigheter', 'all privileges', 'all_privileges',
+        'administrateur', 'administrador', 'administrativ',
+        'vera kontoadministrator',  # nynorsk
+    ])
+
+
+# ---------------------------------------------------------------------------
+# HANDLERS
+# ---------------------------------------------------------------------------
+
+def handle_employee(prompt: str, base_url: str, auth: tuple):
+    first, last = extract_name(prompt)
+    email = extract_email(prompt)
+    phone = extract_phone(prompt)
+
+    body: dict = {"firstName": first, "lastName": last}
+    if email:
+        body["email"] = email
+    if phone:
+        body["phoneNumberMobile"] = phone
+
+    print(f"  Oppretter ansatt: {first} {last}")
+    result = tx("POST", "/employee", base_url, auth, body)
+    emp_id = get_id(result)
+
+    if emp_id and is_admin(prompt):
+        print(f"  Setter ALL_PRIVILEGES for ansatt {emp_id}")
+        tx("PUT", "/employee/entitlement/:grantEntitlementsByTemplate",
+           base_url, auth,
+           params={"employeeId": emp_id, "template": "ALL_PRIVILEGES"})
+
+
+def handle_customer(prompt: str, base_url: str, auth: tuple):
+    name = extract_company_name(prompt)
+    if not name:
+        first, last = extract_name(prompt)
+        name = f"{first} {last}".strip()
+
+    email = extract_email(prompt)
+    org_nr = extract_org_number(prompt)
+    address = extract_address(prompt)
+
+    body: dict = {"name": name, "isCustomer": True}
+    if email:
+        body["email"] = email
+    if org_nr:
+        body["organizationNumber"] = org_nr
+    if address:
+        body["physicalAddress"] = address
+
+    print(f"  Oppretter kunde: {name}")
+    tx("POST", "/customer", base_url, auth, body)
+
+
+def handle_supplier(prompt: str, base_url: str, auth: tuple):
+    name = extract_company_name(prompt)
+    if not name:
+        first, last = extract_name(prompt)
+        name = f"{first} {last}".strip()
+
+    email = extract_email(prompt)
+    org_nr = extract_org_number(prompt)
+
+    body: dict = {"name": name, "isSupplier": True}
+    if email:
+        body["email"] = email
+    if org_nr:
+        body["organizationNumber"] = org_nr
+
+    print(f"  Oppretter leverandør: {name}")
+    tx("POST", "/supplier", base_url, auth, body)
+
+
+def handle_product(prompt: str, base_url: str, auth: tuple):
+    # Quoted name is most reliable
+    name = None
+    m = re.search(r"['\"]([^'\"]+)['\"]", prompt)
+    if m:
+        name = m.group(1)
+    if not name:
+        # "appelé/llamado/named/kalt X"
+        m = re.search(
+            r'(?:appel[eé][e]?\s+|llamad[oa]\s+|named?\s+|kalt\s+|genannt\s+|chamad[oa]\s+)'
+            r'["\']?([^"\',.]+?)["\']?(?:\s+avec|\s+with|\s+med|\s+con|\s+mit|\s+com|,|$)',
+            prompt, re.IGNORECASE
+        )
+        if m:
+            name = m.group(1).strip()
+    if not name:
+        name = "Produkt"
+
+    price = extract_price(prompt)
+    prod_nr = extract_product_number(prompt)
+
+    body: dict = {"name": name}
+    if price is not None:
+        body["priceExcludingVatCurrency"] = price
+    if prod_nr:
+        body["productNumber"] = prod_nr
+
+    print(f"  Oppretter produkt: {name}, pris={price}, nr={prod_nr}")
+    tx("POST", "/product", base_url, auth, body)
+
+
+def handle_department(prompt: str, base_url: str, auth: tuple):
+    name = None
+    # Quoted name
+    m = re.search(r"['\"]([^'\"]+)['\"]", prompt)
+    if m:
+        name = m.group(1)
+    if not name:
+        # "namens X" (German), "named/called X", "kalt X", "appelé X"
+        m = re.search(
+            r'(?:namens|named?\s*|called?\s*|kalt\s*|appel[eé][e]?\s*|llamad[oa]\s*)\s*'
+            r'["\']?([A-ZÆØÅ][^"\',.]+?)["\']?'
+            r'(?=\s+(?:mit|with|med|con|avec|com)|\s+\w*nummer|,|$)',
+            prompt, re.IGNORECASE
+        )
+        if m:
+            name = m.group(1).strip()
+    if not name:
+        name = "Avdeling"
+
+    dept_nr = extract_department_number(prompt)
+    if not dept_nr:
+        dept_nr = "1"
+
+    body: dict = {"name": name, "departmentNumber": dept_nr}
+    print(f"  Oppretter avdeling: {name}, nr={dept_nr}")
+    tx("POST", "/department", base_url, auth, body)
+
+
+def handle_invoice(prompt: str, base_url: str, auth: tuple):
+    today = date.today().isoformat()
+    due = (date.today() + timedelta(days=30)).isoformat()
+
+    # Finn eller opprett kunde
+    company = extract_company_name(prompt)
+    customer_id = None
+
+    if company:
+        r = tx("GET", "/customer", base_url, auth,
+               params={"name": company, "fields": "id,name", "count": 5})
+        values = r.get("values", [])
+        if values:
+            customer_id = values[0]["id"]
+
+    if not customer_id:
+        cname = company or "Fakturakunde"
+        email = extract_email(prompt)
+        cbody: dict = {"name": cname, "isCustomer": True}
+        if email:
+            cbody["email"] = email
+        r = tx("POST", "/customer", base_url, auth, cbody)
+        customer_id = get_id(r)
+
+    if not customer_id:
+        print("  Kunne ikke hente kunde-ID")
+        return
+
+    # Opprett ordre
+    r = tx("POST", "/order", base_url, auth, {
+        "customer": {"id": customer_id},
+        "orderDate": today,
+    })
+    order_id = get_id(r)
+    if not order_id:
+        print("  Kunne ikke hente ordre-ID")
+        return
+
+    # Opprett faktura
+    tx("POST", "/invoice", base_url, auth, {
+        "invoiceDate": today,
+        "invoiceDueDate": due,
+        "customer": {"id": customer_id},
+        "orders": [{"id": order_id}],
+    })
+
+
+def handle_travel_expense(prompt: str, base_url: str, auth: tuple):
+    today = date.today().isoformat()
+
+    r = tx("GET", "/employee", base_url, auth,
+           params={"fields": "id,firstName,lastName", "count": 1})
+    emp_id = None
+    values = r.get("values", [])
+    if values:
+        emp_id = values[0]["id"]
+    if not emp_id:
+        print("  Ingen ansatt funnet for reiseregning")
+        return
+
+    body: dict = {
+        "employee": {"id": emp_id},
+        "travelDetails": {"departureDate": today},
+    }
+    m = re.search(
+        r'(?:beskrivelse|description|Beschreibung|description)\s*[:\s]+([^,.]+)',
+        prompt, re.IGNORECASE
+    )
+    if m:
+        body["description"] = m.group(1).strip()
+
+    tx("POST", "/travelExpense", base_url, auth, body)
+
+
+def handle_project(prompt: str, base_url: str, auth: tuple):
+    today = date.today().isoformat()
+
+    name = None
+    m = re.search(r"['\"]([^'\"]+)['\"]", prompt)
+    if m:
+        name = m.group(1)
+    if not name:
+        m = re.search(
+            r'(?:prosjekt|project|projekt|projet|proyecto|projeto)\s+'
+            r'(?:kalt\s+|med\s+navn\s+|named?\s+|appel[eé][e]?\s+)?'
+            r'([A-ZÆØÅ][^\s,\.]+(?:\s+[^\s,\.]+)*)',
+            prompt, re.IGNORECASE
+        )
+        if m:
+            name = m.group(1).strip()
+    if not name:
+        name = "Prosjekt"
+
+    # Hent første kunde
+    r = tx("GET", "/customer", base_url, auth,
+           params={"fields": "id,name", "count": 1})
+    customer_id = None
+    values = r.get("values", [])
+    if values:
+        customer_id = values[0]["id"]
+    if not customer_id:
+        r = tx("POST", "/customer", base_url, auth,
+               {"name": "Prosjektkunde AS", "isCustomer": True})
+        customer_id = get_id(r)
+
+    body: dict = {"name": name, "number": "1", "startDate": today}
+    if customer_id:
+        body["customer"] = {"id": customer_id}
+
+    print(f"  Oppretter prosjekt: {name}")
+    tx("POST", "/project", base_url, auth, body)
+
+
+# ---------------------------------------------------------------------------
+# FASTAPI RUTER
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
@@ -247,156 +510,36 @@ def health():
 async def solve(request_body: dict):
     try:
         prompt: str = request_body.get("prompt", "")
-        files: list = request_body.get("files", [])
         creds: dict = request_body.get("tripletex_credentials", {})
-
         base_url: str = creds.get("base_url", "").rstrip("/")
         session_token: str = creds.get("session_token", "")
         auth = ("0", session_token)
 
-        print(f"\n=== NY OPPGAVE ===\nPrompt: {prompt[:200]}")
-        print(f"Base URL: {base_url}")
+        print(f"\n=== OPPGAVE ===\n{prompt[:200]}")
 
-        # ---- Bygg brukermelding ----
-        user_content: list = []
+        task = detect_task(prompt)
+        print(f"  → Detektert: {task}")
 
-        for f in files:
-            fname = f.get("filename", "fil")
-            mime = f.get("mime_type", "application/octet-stream")
-            b64 = f.get("content_base64", "")
-            try:
-                if mime.startswith("image/"):
-                    user_content.append({
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": mime, "data": b64},
-                    })
-                elif mime == "application/pdf":
-                    user_content.append({
-                        "type": "document",
-                        "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
-                    })
-                else:
-                    text = base64.b64decode(b64).decode("utf-8", errors="replace")
-                    user_content.append({"type": "text", "text": f"[Fil: {fname}]\n{text}"})
-            except Exception:
-                user_content.append({"type": "text", "text": f"[Fil: {fname} – kunne ikke leses]"})
-
-        admin_keywords = ["administrator", "kontoadministrator", "admin", "administrasjon",
-                         "alle rettigheter", "all_privileges"]
-        is_admin_task = any(kw in prompt.lower() for kw in admin_keywords)
-
-        extra_hint = ""
-        if is_admin_task:
-            extra_hint = (
-                "\n\n⭐ ADMINISTRATOR-OPPGAVE DETEKTERT:\n"
-                "Du MÅ gjøre to kall:\n"
-                "1. POST /employee med firstName, lastName og email\n"
-                "2. PUT /employee/entitlement/:grantEntitlementsByTemplate\n"
-                "   params: {\"employeeId\": <id fra steg 1>, \"template\": \"ALL_PRIVILEGES\"}\n"
-                "   (ingen body nødvendig)\n"
-                "VIKTIG: Ikke bruk 'administrator: true' i PUT /employee – bruk entitlement-endepunktet!"
-            )
-
-        user_content.append({
-            "type": "text",
-            "text": (
-                f"Oppgave: {prompt}\n\n"
-                f"Tripletex base URL: {base_url}\n"
-                f"{extra_hint}\n\n"
-                "Utfør ALLE steg i oppgaven ved å kalle tripletex_api-verktøyet. "
-                "Les hvert svar nøye. Bruk ID fra hvert svar direkte i neste kall. "
-                "Endepunkter: /employee, /customer osv – IKKE /v2/employee. "
-                "Navneparsing: 'Kari Nordmann' → firstName='Kari', lastName='Nordmann'."
-            ),
-        })
-
-        # ---- Tool-definisjon ----
-        tools = [
-            {
-                "name": "tripletex_api",
-                "description": (
-                    "Utfør ett API-kall mot Tripletex v2 REST API. "
-                    "Endepunkter skal være /employee, /customer osv – IKKE /v2/employee. "
-                    "For administrator-rolle: PUT /employee/entitlement/:grantEntitlementsByTemplate "
-                    "med params={employeeId: X, template: 'ALL_PRIVILEGES'}. "
-                    "Returner det faktiske API-svaret slik at du kan bruke ID i neste kall."
-                ),
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "method": {
-                            "type": "string",
-                            "enum": ["GET", "POST", "PUT", "DELETE"],
-                            "description": "HTTP-metode",
-                        },
-                        "endpoint": {
-                            "type": "string",
-                            "description": "API-endepunkt uten /v2 prefix, f.eks. /employee, /customer/123, /employee/entitlement/:grantEntitlementsByTemplate",
-                        },
-                        "data": {
-                            "type": "object",
-                            "description": "Request-body for POST/PUT (JSON-objekt)",
-                        },
-                        "params": {
-                            "type": "object",
-                            "description": "Query-parametere (f.eks. {\"fields\": \"id,name\", \"employeeId\": 123, \"template\": \"ALL_PRIVILEGES\"})",
-                        },
-                    },
-                    "required": ["method", "endpoint"],
-                },
-            }
-        ]
-
-        # ---- Agentisk løkke ----
-        client = anthropic.Anthropic()
-        messages = [{"role": "user", "content": user_content}]
-        max_iterations = 30
-
-        for iteration in range(max_iterations):
-            response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=8096,
-                system=SYSTEM_PROMPT,
-                tools=tools,
-                messages=messages,
-            )
-
-            print(f"  Iterasjon {iteration + 1}: stop_reason={response.stop_reason}")
-            messages.append({"role": "assistant", "content": response.content})
-
-            if response.stop_reason == "end_turn":
-                print("  Claude ferdig.")
-                break
-
-            if response.stop_reason == "tool_use":
-                tool_results = []
-                for block in response.content:
-                    if block.type != "tool_use":
-                        continue
-
-                    inp = block.input
-                    print(f"  → Kaller: {inp.get('method')} {inp.get('endpoint')}")
-                    api_result = make_tripletex_call(
-                        method=inp.get("method", "GET"),
-                        endpoint=inp.get("endpoint", ""),
-                        base_url=base_url,
-                        auth=auth,
-                        data=inp.get("data"),
-                        params=inp.get("params"),
-                    )
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": json.dumps(api_result, ensure_ascii=False),
-                    })
-
-                messages.append({"role": "user", "content": tool_results})
-            else:
-                break
+        if task == "employee":
+            handle_employee(prompt, base_url, auth)
+        elif task == "customer":
+            handle_customer(prompt, base_url, auth)
+        elif task == "supplier":
+            handle_supplier(prompt, base_url, auth)
+        elif task == "product":
+            handle_product(prompt, base_url, auth)
+        elif task == "department":
+            handle_department(prompt, base_url, auth)
+        elif task == "invoice":
+            handle_invoice(prompt, base_url, auth)
+        elif task == "travel_expense":
+            handle_travel_expense(prompt, base_url, auth)
+        elif task == "project":
+            handle_project(prompt, base_url, auth)
 
     except Exception as exc:
         import traceback
-        print(f"KRITISK FEIL i /solve: {exc}")
+        print(f"FEIL: {exc}")
         traceback.print_exc()
 
     return JSONResponse({"status": "completed"})
