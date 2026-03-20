@@ -6,6 +6,7 @@ Agentic loop: Claude bruker tool_use for hvert API-kall og ser faktiske svar.
 import json
 import os
 import base64
+from typing import Optional
 import requests
 from flask import Flask, request, jsonify
 import anthropic
@@ -36,18 +37,30 @@ Oppgaver kan komme på norsk bokmål, nynorsk, engelsk, spansk, tysk, portugisis
 ## ENDEPUNKT-REFERANSE (base_url er allerede /v2 – bruk IKKE /v2/ prefix)
 
 ### ANSATT (employee)
-Opprett: POST /employee
-  Påkrevd: firstName, lastName
-  Valgfritt: email, phoneNumberMobile, employeeNumber, division.id, dateOfBirth (YYYY-MM-DD)
-  Svar: {"value": {"id": 123, ...}}
 
-Sett administrator: PUT /employee/{id}
-  Body: {"id": {id}, "administrator": true}
-  ⭐ KRITISK: Gjør ALLTID dette etter opprettelse hvis "administrator" nevnes (5/10 poeng!)
-  OBS: "administrator" feltet, ikke "isAdministrator"
+⭐ NAVNEPARSING (KRITISK): "Fornavn Etternavn" → firstName="Fornavn", lastName="Etternavn"
+  Eksempel: "Kari Nordmann" → firstName="Kari", lastName="Nordmann"
+  Eksempel: "Ole Martin Hansen" → firstName="Ole Martin", lastName="Hansen"
+  ALDRI sett hele navnet i firstName. ALDRI la lastName stå tom.
+
+Opprett: POST /employee
+  Påkrevd: firstName (fornavn), lastName (etternavn)
+  Valgfritt: email, phoneNumberMobile, employeeNumber, dateOfBirth (YYYY-MM-DD)
+  Svar: {"value": {"id": 123, "firstName": "Kari", "lastName": "Nordmann", ...}}
+  OBS: email-feltet heter "email" (ikke emailAddress)
+
+⭐ ADMINISTRATOR (5/10 poeng – KRITISK):
+  Når prompten sier "administrator", "kontoadministrator" eller lignende:
+  Steg 1 – POST /employee med alle felt:
+    {"firstName": "Kari", "lastName": "Nordmann", "email": "kari@example.org"}
+  Steg 2 – PUT /employee/{id} med ALLE felt fra steg 1 + administrator: true:
+    {"id": 123, "firstName": "Kari", "lastName": "Nordmann", "email": "kari@example.org", "administrator": true}
+
+  ⚠️ PUT er full-replace i Tripletex. Hvis du sender bare {"id": 123, "administrator": true}
+     forsvinner firstName, lastName og email. ALLTID inkluder alle felt i PUT-body!
 
 Oppdater ansatt: PUT /employee/{id}
-  Body: {"id": {id}, ...felt som skal oppdateres}
+  Body: {"id": {id}, firstName, lastName, email, ...alle felt som skal beholdes + felt som oppdateres}
 
 Ansatt med ansattnummer: inkluder employeeNumber (streng) i POST-body
 
@@ -169,8 +182,8 @@ def make_tripletex_call(
     endpoint: str,
     base_url: str,
     auth: tuple,
-    data: dict | None = None,
-    params: dict | None = None,
+    data: Optional[dict] = None,
+    params: Optional[dict] = None,
 ) -> dict:
     """Utfør ett API-kall mot Tripletex og returner responsen."""
     # Sikre at endpoint ikke starter med /v2 (base_url har allerede /v2)
@@ -268,14 +281,32 @@ def solve():
             except Exception:
                 user_content.append({"type": "text", "text": f"[Fil: {fname} – kunne ikke leses]"})
 
+        # Detekter administrator-oppgave og navn for å gi ekstra hint
+        admin_keywords = ["administrator", "kontoadministrator", "admin", "administrasjon"]
+        is_admin_task = any(kw in prompt.lower() for kw in admin_keywords)
+
+        extra_hint = ""
+        if is_admin_task:
+            extra_hint = (
+                "\n\n⭐ ADMINISTRATOR-OPPGAVE DETEKTERT:\n"
+                "Du MÅ gjøre to kall:\n"
+                "1. POST /employee med firstName, lastName og email\n"
+                "2. PUT /employee/{id} med ALLE felt fra steg 1 + \"administrator\": true\n"
+                "Eksempel PUT-body: {\"id\": 123, \"firstName\": \"Kari\", \"lastName\": \"Nordmann\", "
+                "\"email\": \"kari@example.org\", \"administrator\": true}\n"
+                "VIKTIG: PUT er full-replace – inkluder ALLE felt, ikke bare administrator!"
+            )
+
         user_content.append({
             "type": "text",
             "text": (
                 f"Oppgave: {prompt}\n\n"
-                f"Tripletex base URL: {base_url}\n\n"
+                f"Tripletex base URL: {base_url}\n"
+                f"{extra_hint}\n\n"
                 "Utfør ALLE steg i oppgaven ved å kalle tripletex_api-verktøyet. "
                 "Les hvert svar nøye. Bruk ID fra hvert svar direkte i neste kall. "
-                "Minimer antall kall. Husk: endepunkter er /employee, /customer osv – IKKE /v2/employee."
+                "Endepunkter: /employee, /customer osv – IKKE /v2/employee. "
+                "Navneparsing: 'Kari Nordmann' → firstName='Kari', lastName='Nordmann'."
             ),
         })
 
