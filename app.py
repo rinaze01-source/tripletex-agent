@@ -1,6 +1,6 @@
 """
 NM i AI 2026 – Tripletex Agent
-Regelbasert parsing + direkte API-kall. Krever ingen LLM/API-nøkkel.
+Regelbasert agent basert på competition docs.
 """
 
 import re
@@ -15,32 +15,37 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+TODAY = "2026-03-20"
+
 # ---------------------------------------------------------------------------
-# HELPERS – TRIPLETEX API
+# TRIPLETEX API WRAPPER
 # ---------------------------------------------------------------------------
 
 def tx(method: str, endpoint: str, base_url: str, auth: tuple,
-       data: Optional[dict] = None, params: Optional[dict] = None) -> dict:
-    """Gjør ett Tripletex API-kall og returner JSON-svaret."""
+       data: Optional[dict] = None, params: Optional[dict] = None):
+    """Gjør ett Tripletex API-kall. Returnerer JSON eller None ved feil."""
     if endpoint.startswith("/v2/"):
         endpoint = endpoint[3:]
     url = base_url.rstrip("/") + endpoint
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    kwargs = {"auth": auth, "headers": headers, "timeout": 60}
+    kw = {"auth": auth, "headers": headers, "timeout": 60}
     if params:
-        kwargs["params"] = params
+        kw["params"] = params
     method = method.upper()
     try:
         if method == "GET":
-            resp = requests.get(url, **kwargs)
+            resp = requests.get(url, **kw)
         elif method == "POST":
-            resp = requests.post(url, json=data or {}, **kwargs)
+            resp = requests.post(url, json=data or {}, **kw)
         elif method == "PUT":
-            resp = requests.put(url, json=data or {}, **kwargs)
+            if data is not None:
+                resp = requests.put(url, json=data, **kw)
+            else:
+                resp = requests.put(url, **kw)
         elif method == "DELETE":
-            resp = requests.delete(url, **kwargs)
+            resp = requests.delete(url, **kw)
         else:
-            return {"error": "ukjent metode"}
+            return None
         icon = "✓" if resp.status_code < 300 else "✗"
         print(f"  {icon} {method} {endpoint} → {resp.status_code}")
         if resp.status_code >= 400:
@@ -48,21 +53,25 @@ def tx(method: str, endpoint: str, base_url: str, auth: tuple,
         try:
             return resp.json()
         except Exception:
-            return {"status_code": resp.status_code, "text": resp.text[:200]}
+            return {"_status": resp.status_code}
     except Exception as e:
         print(f"  FEIL {method} {endpoint}: {e}")
-        return {"error": str(e)}
+        return None
 
-def val(result: dict) -> Optional[dict]:
-    """Hent value-objekt fra Tripletex-respons."""
-    return result.get("value") if isinstance(result, dict) else None
+def get_id(result) -> Optional[int]:
+    if isinstance(result, dict):
+        v = result.get("value")
+        if isinstance(v, dict):
+            return v.get("id")
+    return None
 
-def get_id(result: dict) -> Optional[int]:
-    v = val(result)
-    return v.get("id") if v else None
+def get_values(result) -> list:
+    if isinstance(result, dict):
+        return result.get("values", [])
+    return []
 
 # ---------------------------------------------------------------------------
-# HELPERS – REGEX-BASERT FELTUTHENTING
+# TEKSTPARSING
 # ---------------------------------------------------------------------------
 
 def extract_email(text: str) -> Optional[str]:
@@ -70,7 +79,7 @@ def extract_email(text: str) -> Optional[str]:
     return m.group(0) if m else None
 
 def extract_phone(text: str) -> Optional[str]:
-    m = re.search(r'\b([\+]?[0-9]{8,12})\b', text)
+    m = re.search(r'(?<!\d)(\+?[0-9]{8,12})(?!\d)', text)
     return m.group(1) if m else None
 
 def extract_orgnr(text: str) -> Optional[str]:
@@ -78,123 +87,105 @@ def extract_orgnr(text: str) -> Optional[str]:
     return m.group(1) if m else None
 
 def extract_price(text: str) -> Optional[float]:
-    # Match tall med komma/punktum som desimalskilletegn
-    m = re.search(r'\b(\d{1,7}(?:[.,]\d{1,2})?)\s*(?:kr|krone|kroner|NOK|couronnes|coronas|Kronen)?\b', text, re.IGNORECASE)
-    if m:
-        return float(m.group(1).replace(',', '.'))
+    # Match tall IKKE 9 siffer (orgnr) - f.eks. 1500, 1500.00, 1 500
+    matches = re.findall(r'\b(\d{1,3}(?:[ .]\d{3})*(?:[.,]\d{1,2})?|\d{1,6}(?:[.,]\d{1,2})?)\b', text)
+    for m in matches:
+        clean = m.replace(' ', '').replace('.', '').replace(',', '.')
+        try:
+            val = float(clean)
+            if 1 <= val <= 999999 and len(str(int(val))) != 9:
+                return val
+        except Exception:
+            pass
     return None
 
-def extract_date(text: str) -> Optional[str]:
-    # ISO-format
+def extract_date(text: str) -> str:
     m = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', text)
     if m:
         return m.group(1)
-    # DD.MM.YYYY
-    m = re.search(r'\b(\d{2})\.(\d{2})\.(\d{4})\b', text)
+    m = re.search(r'\b(\d{2})[./](\d{2})[./](\d{4})\b', text)
     if m:
         return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
-    return "2026-03-20"
-
-def extract_number_str(text: str, label_patterns: list) -> Optional[str]:
-    """Finn et tall etter ett av label_patterns."""
-    for pat in label_patterns:
-        m = re.search(pat + r'[\s:]*(\d+)', text, re.IGNORECASE)
-        if m:
-            return m.group(1)
-    return None
+    return TODAY
 
 def extract_name(text: str) -> tuple:
-    """
-    Prøver å finne fornavn og etternavn fra teksten.
-    Returnerer (firstName, lastName) eller (None, None).
-    """
+    """Returner (firstName, lastName) fra tekst."""
     patterns = [
-        # "navn X Y", "name X Y", "named X Y", "namn X Y", "llamado X Y"
-        r'(?:navn|name|named|namn|llamado|appelé|namens|tilsett)\s+([A-ZÆØÅ][a-zæøåé]+(?:\s[A-ZÆØÅ][a-zæøåé]+)*)',
-        # "ansatt/employee/Mitarbeiter X Y"
-        r'(?:ansatt|employee|Mitarbeiter|empleado|employé)\s+(?:med navn\s+)?([A-ZÆØÅ][a-zæøåé]+(?:\s[A-ZÆØÅ][a-zæøåé]+)*)',
-        # "med navn X Y"
-        r'med\s+navn\s+([A-ZÆØÅ][a-zæøåé]+(?:\s[A-ZÆØÅ][a-zæøåé]+)*)',
-        # Fallback: to store bokstaver i teksten
-        r'\b([A-ZÆØÅ][a-zæøåé]+)\s+([A-ZÆØÅ][a-zæøåé]+)\b',
+        r'(?:med navn|named?|namn|llamad[ao]|appelé[e]?|namens|mit Namen|tilsett)\s+([A-ZÆØÅ][a-zæøåé]+(?:[ -][A-ZÆØÅ][a-zæøåé]+)*)',
+        r'(?:ansatt|employee|Mitarbeiter|empleado|employé[e]?)\s+(?:ved navn\s+|med navn\s+)?([A-ZÆØÅ][a-zæøåé]+(?:\s[A-ZÆØÅ][a-zæøåé]+)+)',
+        r'\b([A-ZÆØÅ][a-zæøåé]+\s+[A-ZÆØÅ][a-zæøåé]+(?:\s+[A-ZÆØÅ][a-zæøåé]+)?)\b(?=.*@)',
     ]
     for pat in patterns:
         m = re.search(pat, text)
         if m:
-            full = m.group(1).strip()
-            parts = full.split()
+            parts = m.group(1).strip().split()
             if len(parts) >= 2:
                 return " ".join(parts[:-1]), parts[-1]
-            elif len(parts) == 1:
-                # Prøv neste match
-                continue
+    # Fallback: finn to store ord
+    m = re.search(r'\b([A-ZÆØÅ][a-zæøåé]+)\s+([A-ZÆØÅ][a-zæøåé]+)\b', text)
+    if m:
+        return m.group(1), m.group(2)
     return None, None
 
-def extract_company_name(text: str) -> Optional[str]:
-    """Finn firmanavn (typisk inneholder AS, ASA, Ltd osv.)"""
-    patterns = [
-        r'(?:kunde|customer|leverandør|supplier|klient|client|Kunde|Lieferant|fournisseur|proveedor)\s+(?:med navn\s+)?["\']?([A-ZÆØÅ][^,\n"\']{2,50}?(?:AS|ASA|Ltd|GmbH|AB|BV|SRL|Inc)?)["\']?(?:\s*,|\s+med|\s+og|\s*$)',
-        r'(?:kalt|called|heißt|llamado|appelé|namens)\s+["\']?([A-ZÆØÅ][^,\n"\']{2,50})["\']?',
-        r'["\']([A-ZÆØÅ][^"\']{3,50}(?:AS|ASA|Ltd|GmbH)?)["\']',
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
+def extract_quoted_or_named(text: str, entity_words: list) -> Optional[str]:
+    """Finn navn i anførselstegn eller etter entity-ord."""
+    # Anførselstegn først
+    m = re.search(r'["\u201c\u2018]([^"\u201d\u2019]{2,80})["\u201d\u2019]', text)
+    if m:
+        return m.group(1).strip()
+    # Etter entity-ord
+    pattern = '|'.join(re.escape(w) for w in entity_words)
+    m = re.search(r'(?:' + pattern + r')\s+(?:med navn\s+|kalt\s+|named?\s+|appelée?\s+|llamad[ao]\s+|namens\s+)?([A-ZÆØÅ0-9][^,\n]{2,60}?)(?:\s*,|\s+med|\s+og|\s+epost|\s+e-post|\s*$)', text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
     return None
 
-def extract_product_name(text: str) -> Optional[str]:
-    patterns = [
-        r'(?:produkt|product|Produkt|produit|producto)\s+(?:med navn\s+)?["\']?([A-ZÆØÅa-zæøå][^,\n"\']{2,60})["\']?(?:\s*,|\s+med|\s+pris|\s+og|\s*$)',
-        r'(?:kalt|called|appelé|llamado|namens)\s+["\']?([^,\n"\']{3,60})["\']?',
-        r'["\']([^"\']{3,60})["\']',
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    return None
+def is_admin(text: str) -> bool:
+    words = ["administrator", "kontoadministrator", "admin",
+             "administrador", "administrateur", "verwalter",
+             "account administrator", "all privileges", "alle rettigheter"]
+    return any(w in text.lower() for w in words)
 
-def extract_department_name(text: str) -> Optional[str]:
-    patterns = [
-        r'(?:avdeling|department|Abteilung|département|departamento)\s+(?:med navn\s+)?["\']?([A-ZÆØÅa-zæøå][^,\n"\']{2,60})["\']?(?:\s*,|\s+med|\s+nummer|\s*$)',
-        r'(?:kalt|called|namens|appelée?|llamad[ao])\s+["\']?([^,\n"\']{3,60})["\']?',
-        r'["\']([^"\']{3,60})["\']',
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    return None
-
-def is_admin_task(text: str) -> bool:
-    keywords = ["administrator", "kontoadministrator", "admin",
-                 "administrador", "administrateur", "verwalter",
-                 "account administrator", "konto administrator"]
-    return any(k in text.lower() for k in keywords)
-
-def detect_task_type(text: str) -> str:
+def detect_task(text: str) -> str:
     t = text.lower()
-    # Sjekk i prioritert rekkefølge
-    if any(k in t for k in ["reiseregning", "travel expense", "reisekostenabr", "gasto de viaje", "note de frais"]):
-        return "travelExpense"
-    if any(k in t for k in ["faktura", "invoice", "rechnung", "factura", "facture"]):
+    # Slett/delete
+    if any(w in t for w in ["slett", "delete", "fjern", "löschen", "eliminar", "supprimer", "reverser", "kreditnota", "credit note"]):
+        if any(w in t for w in ["reiseregning", "travel", "expense", "reisekostenabr"]):
+            return "delete_travel"
+        if any(w in t for w in ["faktura", "invoice", "rechnung", "factura", "facture"]):
+            return "credit_note"
+        return "delete_generic"
+    # Ordre + faktura
+    if any(w in t for w in ["faktura", "invoice", "rechnung", "factura", "facture"]):
+        if any(w in t for w in ["betal", "payment", "zahlung", "pago", "paiement"]):
+            return "invoice_payment"
         return "invoice"
-    if any(k in t for k in ["ordre", "order", "bestellung", "pedido", "commande"]):
-        return "order"
-    if any(k in t for k in ["prosjekt", "project", "projekt", "proyecto", "projet"]):
+    # Betaling
+    if any(w in t for w in ["betal", "payment", "zahlung", "pago", "paiement"]):
+        return "invoice_payment"
+    # Reiseregning
+    if any(w in t for w in ["reiseregning", "travel expense", "reisekostenabr", "gasto de viaje", "note de frais", "reise"]):
+        return "travel"
+    # Prosjekt
+    if any(w in t for w in ["prosjekt", "project", "projekt", "proyecto", "projet"]):
         return "project"
-    if any(k in t for k in ["avdeling", "department", "abteilung", "département", "departamento"]):
+    # Avdeling
+    if any(w in t for w in ["avdeling", "department", "abteilung", "département", "departamento"]):
         return "department"
-    if any(k in t for k in ["leverandør", "supplier", "lieferant", "proveedor", "fournisseur"]):
+    # Leverandør
+    if any(w in t for w in ["leverandør", "supplier", "lieferant", "proveedor", "fournisseur"]):
         return "supplier"
-    if any(k in t for k in ["produkt", "product", "producto", "produit"]):
+    # Produkt
+    if any(w in t for w in ["produkt", "vare", "product", "producto", "produit", "artikel"]):
         return "product"
-    if any(k in t for k in ["kunde", "customer", "klient", "client", "kunde"]):
+    # Kunde
+    if any(w in t for w in ["kunde", "customer", "klient", "client", "kunder"]):
         return "customer"
-    if any(k in t for k in ["ansatt", "employee", "medarbeider", "mitarbeiter", "empleado", "employé", "tilsett", "tilsatt"]):
+    # Ansatt (inkl. oppdater)
+    if any(w in t for w in ["ansatt", "employee", "medarbeider", "mitarbeiter", "empleado",
+                              "employé", "tilsett", "tilsatt", "arbeidstaker"]):
         return "employee"
-    # Fallback: se etter navn/epost = trolig ansatt
+    # Fallback: epost = ansatt
     if extract_email(text):
         return "employee"
     return "unknown"
@@ -209,7 +200,7 @@ def handle_employee(prompt: str, base_url: str, auth: tuple):
     phone = extract_phone(prompt)
 
     if not first or not last:
-        print("  Kunne ikke parse navn fra prompt")
+        print(f"  Kunne ikke parse navn — prøver fallback")
         return
 
     body = {"firstName": first, "lastName": last}
@@ -220,22 +211,25 @@ def handle_employee(prompt: str, base_url: str, auth: tuple):
 
     result = tx("POST", "/employee", base_url, auth, body)
     emp_id = get_id(result)
-    print(f"  Ansatt opprettet: id={emp_id}, {first} {last}")
+    print(f"  Ansatt opprettet: id={emp_id}, {first} {last}, email={email}")
 
-    if emp_id and is_admin_task(prompt):
-        # Korrekt måte å sette administrator i Tripletex:
-        # PUT /employee/entitlement/:grantEntitlementsByTemplate?employeeId=X&template=ALL_PRIVILEGES
+    if emp_id and is_admin(prompt):
+        # Korrekt metode: grantEntitlementsByTemplate med ALL_PRIVILEGES
         tx("PUT", "/employee/entitlement/:grantEntitlementsByTemplate",
-           base_url, auth, params={"employeeId": emp_id, "template": "ALL_PRIVILEGES"})
-        print(f"  Administrator-rolle (ALL_PRIVILEGES) satt for {first} {last}")
+           base_url, auth,
+           params={"employeeId": emp_id, "template": "ALL_PRIVILEGES"})
+        print(f"  Administrator (ALL_PRIVILEGES) satt")
 
 
-def handle_customer(prompt: str, base_url: str, auth: tuple):
-    name = extract_company_name(prompt)
+def handle_customer(prompt: str, base_url: str, auth: tuple) -> Optional[int]:
+    name = extract_quoted_or_named(prompt, [
+        "kunde", "customer", "klient", "client", "Kunde", "Lieferant", "kunden"
+    ])
     if not name:
-        # Fallback: bruk personnavn
         first, last = extract_name(prompt)
-        name = f"{first} {last}" if first else "Ukjent Kunde AS"
+        name = f"{first} {last}" if first else None
+    if not name:
+        name = "Ny Kunde AS"
 
     email = extract_email(prompt)
     phone = extract_phone(prompt)
@@ -249,30 +243,18 @@ def handle_customer(prompt: str, base_url: str, auth: tuple):
     if orgnr:
         body["organizationNumber"] = orgnr
 
-    # Adresse
-    city_m = re.search(r'\b(Oslo|Bergen|Trondheim|Stavanger|Tromsø|Kristiansand|Drammen|Fredrikstad|Sandnes|Bodø)\b', prompt, re.IGNORECASE)
-    street_m = re.search(r'(?:adresse|address|Adresse)\s+([A-ZÆØÅ][^,\n]{3,40})', prompt, re.IGNORECASE)
-    postal_m = re.search(r'\b(\d{4})\b', prompt)
-
-    if city_m or street_m:
-        addr = {"country": {"id": 1}}
-        if street_m:
-            addr["addressLine1"] = street_m.group(1).strip()
-        if city_m:
-            addr["city"] = city_m.group(1)
-        if postal_m:
-            addr["postalCode"] = postal_m.group(1)
-        body["physicalAddress"] = addr
-
     result = tx("POST", "/customer", base_url, auth, body)
-    print(f"  Kunde opprettet: id={get_id(result)}, {name}")
+    cust_id = get_id(result)
+    print(f"  Kunde opprettet: id={cust_id}, {name}")
+    return cust_id
 
 
 def handle_supplier(prompt: str, base_url: str, auth: tuple):
-    name = extract_company_name(prompt)
+    name = extract_quoted_or_named(prompt, [
+        "leverandør", "supplier", "lieferant", "proveedor", "fournisseur"
+    ])
     if not name:
-        first, last = extract_name(prompt)
-        name = f"{first} {last}" if first else "Ukjent Leverandør AS"
+        name = "Ny Leverandør AS"
 
     email = extract_email(prompt)
     phone = extract_phone(prompt)
@@ -290,15 +272,18 @@ def handle_supplier(prompt: str, base_url: str, auth: tuple):
     print(f"  Leverandør opprettet: id={get_id(result)}, {name}")
 
 
-def handle_product(prompt: str, base_url: str, auth: tuple):
-    name = extract_product_name(prompt)
+def handle_product(prompt: str, base_url: str, auth: tuple) -> Optional[int]:
+    name = extract_quoted_or_named(prompt, [
+        "produkt", "vare", "product", "producto", "produit", "artikel", "Produkt"
+    ])
     if not name:
-        name = "Produkt"
+        name = "Nytt produkt"
 
     price = extract_price(prompt)
-    prodnr_m = re.search(r'(?:produktnummer|product.?number|Produktnummer|numéro)[:\s]+([A-Za-z0-9-]+)', prompt, re.IGNORECASE)
+
+    prodnr_m = re.search(r'(?:produktnummer|product.?number|Produktnummer|numéro|número|nr)[:\s.]+([A-Za-z0-9-]+)', prompt, re.IGNORECASE)
     if not prodnr_m:
-        prodnr_m = re.search(r'\b(P\d{2,6})\b', prompt)
+        prodnr_m = re.search(r'\b([A-Z]{1,3}\d{2,6})\b', prompt)
 
     body = {"name": name}
     if price:
@@ -306,52 +291,201 @@ def handle_product(prompt: str, base_url: str, auth: tuple):
     if prodnr_m:
         body["productNumber"] = prodnr_m.group(1)
 
-    desc_m = re.search(r'(?:beskrivelse|description|Beschreibung|descripción)[:\s]+([^,\n]{3,100})', prompt, re.IGNORECASE)
-    if desc_m:
-        body["description"] = desc_m.group(1).strip()
-
     result = tx("POST", "/product", base_url, auth, body)
-    print(f"  Produkt opprettet: id={get_id(result)}, {name}")
+    prod_id = get_id(result)
+    print(f"  Produkt opprettet: id={prod_id}, {name}, pris={price}")
+    return prod_id
 
 
-def handle_department(prompt: str, base_url: str, auth: tuple):
-    name = extract_department_name(prompt)
-    if not name:
-        name = "Ny avdeling"
+def handle_invoice(prompt: str, base_url: str, auth: tuple):
+    """
+    Flyt fra docs: GET/POST /customer → POST /order → POST /invoice
+    På fresh account: må opprette kunde og produkt/ordre
+    """
+    date = extract_date(prompt)
+    due_date_m = re.search(r'(?:forfallsdato|due.?date|Fälligkeit|fecha.?vencimiento|échéance)[:\s]+(\d{4}-\d{2}-\d{2}|\d{2}[./]\d{2}[./]\d{4})', prompt, re.IGNORECASE)
 
-    deptnr = extract_number_str(prompt, [
-        r'avdelingsnummer', r'department.?number', r'Abteilungsnummer',
-        r'numéro', r'número', r'nummer'
-    ])
-    if not deptnr:
-        deptnr = str(random.randint(10, 99))
+    # Forfallsdato: 30 dager etter fakturadato
+    due_date = due_date_m.group(1) if due_date_m else "2026-04-19"
 
-    body = {"name": name, "departmentNumber": deptnr}
-    result = tx("POST", "/department", base_url, auth, body)
-    print(f"  Avdeling opprettet: id={get_id(result)}, {name}")
+    # Opprett kunde
+    cust_name = extract_quoted_or_named(prompt, ["kunde", "customer", "klient", "client"])
+    if not cust_name:
+        first, last = extract_name(prompt)
+        cust_name = f"{first} {last}" if first else "Fakturakunde AS"
+
+    email = extract_email(prompt)
+    cust_body = {"name": cust_name, "isCustomer": True}
+    if email:
+        cust_body["email"] = email
+
+    cust_result = tx("POST", "/customer", base_url, auth, cust_body)
+    cust_id = get_id(cust_result)
+    if not cust_id:
+        print("  Kunde-oppretting feilet")
+        return
+
+    # Opprett ordre med ordrelinje
+    price = extract_price(prompt) or 1000.0
+    order_body = {
+        "customer": {"id": cust_id},
+        "orderDate": date,
+        "orderLines": [
+            {
+                "description": "Tjeneste",
+                "count": 1.0,
+                "unitPriceExcludingVatCurrency": price
+            }
+        ]
+    }
+    order_result = tx("POST", "/order", base_url, auth, order_body)
+    order_id = get_id(order_result)
+    if not order_id:
+        print("  Ordre-oppretting feilet")
+        return
+
+    # Opprett faktura
+    inv_body = {
+        "invoiceDate": date,
+        "invoiceDueDate": due_date,
+        "customer": {"id": cust_id},
+        "orders": [{"id": order_id}]
+    }
+    inv_result = tx("POST", "/invoice", base_url, auth, inv_body)
+    inv_id = get_id(inv_result)
+    print(f"  Faktura opprettet: id={inv_id}, kunde={cust_id}, ordre={order_id}")
+
+    # Send faktura via e-post hvis nevnt
+    if inv_id and any(w in prompt.lower() for w in ["send", "epost", "e-post", "email", "sende"]):
+        tx("PUT", f"/invoice/{inv_id}/:send", base_url, auth,
+           params={"sendType": "EMAIL"})
+        print(f"  Faktura sendt via e-post")
+
+
+def handle_invoice_payment(prompt: str, base_url: str, auth: tuple):
+    """
+    Flyt fra docs: POST /customer → POST /invoice → POST /payment
+    """
+    date = extract_date(prompt)
+    price = extract_price(prompt) or 1000.0
+
+    # Opprett kunde
+    cust_name = extract_quoted_or_named(prompt, ["kunde", "customer", "klient", "client"])
+    if not cust_name:
+        first, last = extract_name(prompt)
+        cust_name = f"{first} {last}" if first else "Betalingskunde AS"
+
+    email = extract_email(prompt)
+    cust_body = {"name": cust_name, "isCustomer": True}
+    if email:
+        cust_body["email"] = email
+
+    cust_result = tx("POST", "/customer", base_url, auth, cust_body)
+    cust_id = get_id(cust_result)
+    if not cust_id:
+        return
+
+    # Opprett ordre
+    order_result = tx("POST", "/order", base_url, auth, {
+        "customer": {"id": cust_id},
+        "orderDate": date,
+        "orderLines": [{"description": "Tjeneste", "count": 1.0,
+                        "unitPriceExcludingVatCurrency": price}]
+    })
+    order_id = get_id(order_result)
+    if not order_id:
+        return
+
+    # Opprett faktura
+    inv_result = tx("POST", "/invoice", base_url, auth, {
+        "invoiceDate": date,
+        "invoiceDueDate": "2026-04-19",
+        "customer": {"id": cust_id},
+        "orders": [{"id": order_id}]
+    })
+    inv_id = get_id(inv_result)
+    if not inv_id:
+        return
+
+    # Registrer betaling
+    pay_result = tx("POST", f"/invoice/{inv_id}/payment", base_url, auth, {
+        "paymentDate": date,
+        "amount": price,
+        "paymentTypeId": 1
+    })
+    print(f"  Betaling registrert på faktura {inv_id}: {pay_result}")
+
+
+def handle_travel(prompt: str, base_url: str, auth: tuple):
+    """Opprett reiseregning."""
+    date = extract_date(prompt)
+    first, last = extract_name(prompt)
+    desc_m = re.search(r'(?:beskrivelse|description|reise til|travel to|Reise nach)[:\s]+([^\n,]{3,80})', prompt, re.IGNORECASE)
+    desc = desc_m.group(1).strip() if desc_m else "Tjenestereise"
+
+    # Finn eller opprett ansatt
+    emp_id = None
+    if first and last:
+        search = tx("GET", "/employee", base_url, auth,
+                    params={"firstName": first, "lastName": last,
+                            "fields": "id,firstName,lastName", "count": 5})
+        vals = get_values(search)
+        if vals:
+            emp_id = vals[0]["id"]
+
+    if not emp_id:
+        # Hent første ansatt
+        search = tx("GET", "/employee", base_url, auth,
+                    params={"fields": "id,firstName", "count": 1})
+        vals = get_values(search)
+        if vals:
+            emp_id = vals[0]["id"]
+
+    if not emp_id:
+        print("  Ingen ansatt funnet for reiseregning")
+        return
+
+    result = tx("POST", "/travelExpense", base_url, auth, {
+        "employee": {"id": emp_id},
+        "description": desc,
+        "travelDetails": {"departureDate": date}
+    })
+    print(f"  Reiseregning opprettet: id={get_id(result)}")
+
+
+def handle_delete_travel(prompt: str, base_url: str, auth: tuple):
+    """Flyt fra docs: GET /travelExpense → DELETE /travelExpense/{id}"""
+    result = tx("GET", "/travelExpense", base_url, auth,
+                params={"fields": "id,description", "count": 100})
+    vals = get_values(result)
+    if not vals:
+        print("  Ingen reiseregninger å slette")
+        return
+    # Slett den siste/første
+    expense_id = vals[-1]["id"]
+    tx("DELETE", f"/travelExpense/{expense_id}", base_url, auth)
+    print(f"  Reiseregning slettet: id={expense_id}")
 
 
 def handle_project(prompt: str, base_url: str, auth: tuple):
-    # Finn prosjektnavn
-    name_m = re.search(r'(?:prosjekt|project|Projekt|projet|proyecto)\s+(?:kalt\s+|named\s+|appelé\s+)?["\']?([A-ZÆØÅa-zæøå][^,\n"\']{2,60})["\']?', prompt, re.IGNORECASE)
-    name = name_m.group(1).strip() if name_m else "Nytt prosjekt"
+    name_m = re.search(r'(?:prosjekt|project|Projekt|projet|proyecto)\s+(?:kalt\s+|named?\s+|appelée?\s+)?["\']?([A-ZÆØÅa-zæøå][^,\n"\']{2,60})["\']?(?:\s*,|\s+med|\s+fra|\s*$)', prompt, re.IGNORECASE)
+    name = name_m.group(1).strip() if name_m else extract_quoted_or_named(prompt, ["prosjekt", "project"]) or "Nytt prosjekt"
 
     date = extract_date(prompt)
-    end_m = re.search(r'(?:sluttdato|end.?date|Enddatum)[:\s]+(\d{4}-\d{2}-\d{2})', prompt, re.IGNORECASE)
+    end_m = re.search(r'(?:sluttdato|end.?date|Enddatum|fecha fin)[:\s]+(\d{4}-\d{2}-\d{2})', prompt, re.IGNORECASE)
+    projnr = str(random.randint(1000, 9999))
 
-    projnr = extract_number_str(prompt, [r'prosjektnummer', r'project.?number', r'nummer'])
-    if not projnr:
-        projnr = str(random.randint(1000, 9999))
+    # Opprett kunde for prosjektet
+    cust_name = extract_quoted_or_named(prompt, ["kunde", "customer", "klient"])
+    if not cust_name:
+        cust_name = "Prosjektkunde AS"
 
-    # Trenger kunde — søk etter eksisterende eller opprett dummy
-    cust_result = tx("GET", "/customer", base_url, auth, params={"count": 1, "fields": "id,name"})
-    cust_values = cust_result.get("values", []) if isinstance(cust_result, dict) else []
-    if cust_values:
-        cust_id = cust_values[0]["id"]
-    else:
-        # Opprett en dummy-kunde
-        c = tx("POST", "/customer", base_url, auth, {"name": "Prosjektkunde AS", "isCustomer": True})
-        cust_id = get_id(c) or 0
+    cust_result = tx("POST", "/customer", base_url, auth, {
+        "name": cust_name, "isCustomer": True
+    })
+    cust_id = get_id(cust_result)
+    if not cust_id:
+        return
 
     body = {
         "name": name,
@@ -366,40 +500,21 @@ def handle_project(prompt: str, base_url: str, auth: tuple):
     print(f"  Prosjekt opprettet: id={get_id(result)}, {name}")
 
 
-def handle_travel_expense(prompt: str, base_url: str, auth: tuple):
-    date = extract_date(prompt)
-    desc_m = re.search(r'(?:beskrivelse|description|Beschreibung|descripción)[:\s]+([^,\n]{3,100})', prompt, re.IGNORECASE)
-    desc = desc_m.group(1).strip() if desc_m else "Reise"
+def handle_department(prompt: str, base_url: str, auth: tuple):
+    name = extract_quoted_or_named(prompt, [
+        "avdeling", "department", "Abteilung", "département", "departamento"
+    ])
+    if not name:
+        name = "Ny avdeling"
 
-    # Finn eller opprett ansatt
-    first, last = extract_name(prompt)
-    emp_id = None
+    deptnr_m = re.search(r'(?:avdelingsnummer|department.?number|Abteilungsnummer|numéro|número|nummer)[:\s]+(\d+)', prompt, re.IGNORECASE)
+    deptnr = deptnr_m.group(1) if deptnr_m else str(random.randint(10, 99))
 
-    if first and last:
-        search = tx("GET", "/employee", base_url, auth,
-                    params={"firstName": first, "lastName": last, "fields": "id,firstName,lastName", "count": 5})
-        vals = search.get("values", []) if isinstance(search, dict) else []
-        if vals:
-            emp_id = vals[0]["id"]
-
-    if not emp_id:
-        # Hent første ansatt
-        search = tx("GET", "/employee", base_url, auth, params={"fields": "id,firstName", "count": 1})
-        vals = search.get("values", []) if isinstance(search, dict) else []
-        if vals:
-            emp_id = vals[0]["id"]
-
-    if not emp_id:
-        print("  Ingen ansatt funnet for reiseregning")
-        return
-
-    body = {
-        "employee": {"id": emp_id},
-        "description": desc,
-        "travelDetails": {"departureDate": date}
-    }
-    result = tx("POST", "/travelExpense", base_url, auth, body)
-    print(f"  Reiseregning opprettet: id={get_id(result)}")
+    result = tx("POST", "/department", base_url, auth, {
+        "name": name,
+        "departmentNumber": deptnr
+    })
+    print(f"  Avdeling opprettet: id={get_id(result)}, {name}")
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +540,6 @@ def solve():
 
         print(f"\n=== NY OPPGAVE ===\nPrompt: {prompt[:200]}")
 
-        # Håndter vedlagte filer
         for f in files:
             try:
                 data = base64.b64decode(f.get("content_base64", ""))
@@ -433,7 +547,7 @@ def solve():
             except Exception:
                 pass
 
-        task = detect_task_type(prompt)
+        task = detect_task(prompt)
         print(f"  Oppgavetype: {task}")
 
         if task == "employee":
@@ -444,18 +558,24 @@ def solve():
             handle_supplier(prompt, base_url, auth)
         elif task == "product":
             handle_product(prompt, base_url, auth)
-        elif task == "department":
-            handle_department(prompt, base_url, auth)
+        elif task == "invoice":
+            handle_invoice(prompt, base_url, auth)
+        elif task == "invoice_payment":
+            handle_invoice_payment(prompt, base_url, auth)
+        elif task == "travel":
+            handle_travel(prompt, base_url, auth)
+        elif task == "delete_travel":
+            handle_delete_travel(prompt, base_url, auth)
         elif task == "project":
             handle_project(prompt, base_url, auth)
-        elif task == "travelExpense":
-            handle_travel_expense(prompt, base_url, auth)
+        elif task == "department":
+            handle_department(prompt, base_url, auth)
         else:
-            print(f"  Ukjent oppgavetype for: {prompt[:100]}")
+            print(f"  Ukjent oppgavetype")
 
     except Exception as exc:
         import traceback
-        print(f"KRITISK FEIL i /solve: {exc}")
+        print(f"KRITISK FEIL: {exc}")
         traceback.print_exc()
 
     return jsonify({"status": "completed"})
