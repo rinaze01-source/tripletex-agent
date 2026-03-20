@@ -1,6 +1,6 @@
 """
 NM i AI 2026 – Tripletex Agent
-Agentic loop: Claude bruker tool_use for hvert API-kall og ser faktiske svar.
+FastAPI + agentic loop med Claude tool_use.
 """
 
 import json
@@ -8,10 +8,11 @@ import os
 import base64
 from typing import Optional
 import requests
-from flask import Flask, request, jsonify
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 import anthropic
 
-app = Flask(__name__)
+app = FastAPI()
 
 # ---------------------------------------------------------------------------
 # SYSTEM PROMPT
@@ -50,17 +51,20 @@ Opprett: POST /employee
   OBS: email-feltet heter "email" (ikke emailAddress)
 
 ⭐ ADMINISTRATOR (5/10 poeng – KRITISK):
-  Når prompten sier "administrator", "kontoadministrator" eller lignende:
+  Når prompten sier "administrator", "kontoadministrator", "admin" eller lignende:
   Steg 1 – POST /employee med alle felt:
     {"firstName": "Kari", "lastName": "Nordmann", "email": "kari@example.org"}
-  Steg 2 – PUT /employee/{id} med ALLE felt fra steg 1 + administrator: true:
-    {"id": 123, "firstName": "Kari", "lastName": "Nordmann", "email": "kari@example.org", "administrator": true}
+  Steg 2 – PUT /employee/entitlement/:grantEntitlementsByTemplate med query-parametere:
+    method=PUT, endpoint=/employee/entitlement/:grantEntitlementsByTemplate
+    params={"employeeId": <id fra steg 1>, "template": "ALL_PRIVILEGES"}
+    (ingen body nødvendig)
 
-  ⚠️ PUT er full-replace i Tripletex. Hvis du sender bare {"id": 123, "administrator": true}
-     forsvinner firstName, lastName og email. ALLTID inkluder alle felt i PUT-body!
+  ⚠️ IKKE bruk "administrator: true" i PUT /employee – det feltet finnes ikke!
+  ⚠️ Bruk ALLTID entitlement-endepunktet for administrator-rolle!
 
 Oppdater ansatt: PUT /employee/{id}
   Body: {"id": {id}, firstName, lastName, email, ...alle felt som skal beholdes + felt som oppdateres}
+  OBS: PUT er full-replace – inkluder ALLE felt du vil beholde!
 
 Ansatt med ansattnummer: inkluder employeeNumber (streng) i POST-body
 
@@ -153,7 +157,7 @@ Liste-svar format: {"fullResultSize": N, "values": [...]}
 - leverandør = supplier              | dato = date
 - reiseregning = travelExpense       | beskrivelse = description
 - kontaktperson = contact            | organisasjonsnummer = organizationNumber
-- bilag = voucher                    | administrator = administrator: true
+- bilag = voucher                    | administrator = entitlement ALL_PRIVILEGES
 - fakturadato = invoiceDate          | forfallsdato = invoiceDueDate
 - bestillingsnummer = orderNumber    | produktnummer = productNumber
 
@@ -186,9 +190,8 @@ def make_tripletex_call(
     params: Optional[dict] = None,
 ) -> dict:
     """Utfør ett API-kall mot Tripletex og returner responsen."""
-    # Sikre at endpoint ikke starter med /v2 (base_url har allerede /v2)
     if endpoint.startswith("/v2/"):
-        endpoint = endpoint[3:]  # fjern /v2
+        endpoint = endpoint[3:]
 
     url = base_url.rstrip("/") + endpoint
     try:
@@ -214,7 +217,6 @@ def make_tripletex_call(
         except Exception:
             result = {"status_code": resp.status_code, "text": resp.text[:500]}
 
-        # Legg til statuskode i svaret for at Claude skal se om det er feil
         if isinstance(result, dict):
             result["_http_status"] = resp.status_code
         else:
@@ -233,21 +235,20 @@ def make_tripletex_call(
 
 
 # ---------------------------------------------------------------------------
-# FLASK-RUTER
+# FASTAPI-RUTER
 # ---------------------------------------------------------------------------
 
-@app.route("/health", methods=["GET"])
+@app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return {"status": "ok"}
 
 
-@app.route("/solve", methods=["POST"])
-def solve():
+@app.post("/solve")
+async def solve(request_body: dict):
     try:
-        body = request.get_json(force=True, silent=True) or {}
-        prompt: str = body.get("prompt", "")
-        files: list = body.get("files", [])
-        creds: dict = body.get("tripletex_credentials", {})
+        prompt: str = request_body.get("prompt", "")
+        files: list = request_body.get("files", [])
+        creds: dict = request_body.get("tripletex_credentials", {})
 
         base_url: str = creds.get("base_url", "").rstrip("/")
         session_token: str = creds.get("session_token", "")
@@ -259,7 +260,6 @@ def solve():
         # ---- Bygg brukermelding ----
         user_content: list = []
 
-        # Legg til vedlagte filer
         for f in files:
             fname = f.get("filename", "fil")
             mime = f.get("mime_type", "application/octet-stream")
@@ -281,8 +281,8 @@ def solve():
             except Exception:
                 user_content.append({"type": "text", "text": f"[Fil: {fname} – kunne ikke leses]"})
 
-        # Detekter administrator-oppgave og navn for å gi ekstra hint
-        admin_keywords = ["administrator", "kontoadministrator", "admin", "administrasjon"]
+        admin_keywords = ["administrator", "kontoadministrator", "admin", "administrasjon",
+                         "alle rettigheter", "all_privileges"]
         is_admin_task = any(kw in prompt.lower() for kw in admin_keywords)
 
         extra_hint = ""
@@ -291,10 +291,10 @@ def solve():
                 "\n\n⭐ ADMINISTRATOR-OPPGAVE DETEKTERT:\n"
                 "Du MÅ gjøre to kall:\n"
                 "1. POST /employee med firstName, lastName og email\n"
-                "2. PUT /employee/{id} med ALLE felt fra steg 1 + \"administrator\": true\n"
-                "Eksempel PUT-body: {\"id\": 123, \"firstName\": \"Kari\", \"lastName\": \"Nordmann\", "
-                "\"email\": \"kari@example.org\", \"administrator\": true}\n"
-                "VIKTIG: PUT er full-replace – inkluder ALLE felt, ikke bare administrator!"
+                "2. PUT /employee/entitlement/:grantEntitlementsByTemplate\n"
+                "   params: {\"employeeId\": <id fra steg 1>, \"template\": \"ALL_PRIVILEGES\"}\n"
+                "   (ingen body nødvendig)\n"
+                "VIKTIG: Ikke bruk 'administrator: true' i PUT /employee – bruk entitlement-endepunktet!"
             )
 
         user_content.append({
@@ -316,9 +316,10 @@ def solve():
                 "name": "tripletex_api",
                 "description": (
                     "Utfør ett API-kall mot Tripletex v2 REST API. "
-                    "VIKTIG: Endepunkter skal være /employee, /customer osv – IKKE /v2/employee. "
-                    "Returner det faktiske API-svaret slik at du kan bruke ID i neste kall. "
-                    "Ved PUT: inkluder alltid 'id'-feltet i body."
+                    "Endepunkter skal være /employee, /customer osv – IKKE /v2/employee. "
+                    "For administrator-rolle: PUT /employee/entitlement/:grantEntitlementsByTemplate "
+                    "med params={employeeId: X, template: 'ALL_PRIVILEGES'}. "
+                    "Returner det faktiske API-svaret slik at du kan bruke ID i neste kall."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -330,7 +331,7 @@ def solve():
                         },
                         "endpoint": {
                             "type": "string",
-                            "description": "API-endepunkt uten /v2 prefix, f.eks. /employee, /customer/123, /invoice/456/:send",
+                            "description": "API-endepunkt uten /v2 prefix, f.eks. /employee, /customer/123, /employee/entitlement/:grantEntitlementsByTemplate",
                         },
                         "data": {
                             "type": "object",
@@ -338,7 +339,7 @@ def solve():
                         },
                         "params": {
                             "type": "object",
-                            "description": "Query-parametere (f.eks. {\"fields\": \"id,name\", \"count\": 10, \"sendType\": \"EMAIL\"})",
+                            "description": "Query-parametere (f.eks. {\"fields\": \"id,name\", \"employeeId\": 123, \"template\": \"ALL_PRIVILEGES\"})",
                         },
                     },
                     "required": ["method", "endpoint"],
@@ -361,16 +362,12 @@ def solve():
             )
 
             print(f"  Iterasjon {iteration + 1}: stop_reason={response.stop_reason}")
-
-            # Legg til assistent-svar i meldingshistorikk
             messages.append({"role": "assistant", "content": response.content})
 
-            # Ferdig – Claude svarte med tekst og ingen flere verktøykall
             if response.stop_reason == "end_turn":
                 print("  Claude ferdig.")
                 break
 
-            # Prosesser verktøykall
             if response.stop_reason == "tool_use":
                 tool_results = []
                 for block in response.content:
@@ -395,7 +392,6 @@ def solve():
 
                 messages.append({"role": "user", "content": tool_results})
             else:
-                # Ukjent stop_reason – avslutt
                 break
 
     except Exception as exc:
@@ -403,14 +399,4 @@ def solve():
         print(f"KRITISK FEIL i /solve: {exc}")
         traceback.print_exc()
 
-    # Returner alltid "completed"
-    return jsonify({"status": "completed"})
-
-
-# ---------------------------------------------------------------------------
-# OPPSTART
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    print(f"Starter Tripletex-agent på port {port}...")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    return JSONResponse({"status": "completed"})
