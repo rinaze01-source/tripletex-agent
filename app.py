@@ -1,253 +1,36 @@
 """
 NM i AI 2026 – Tripletex Agent
-Agentic loop: Claude bruker tool_use for hvert API-kall og ser faktiske svar.
+Regelbasert parsing + direkte API-kall. Krever ingen LLM/API-nøkkel.
 """
 
-import json
+import re
 import os
+import json
 import base64
+import random
+from pathlib import Path
 from typing import Optional
 import requests
 from flask import Flask, request, jsonify
-import anthropic
 
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# SYSTEM PROMPT
-# ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """Du er en ekspert Tripletex regnskaps-API-agent for NM i AI 2026.
-Oppgaver kan komme på: norsk bokmål, nynorsk, engelsk, tysk, spansk, portugisisk, fransk.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## ABSOLUTTE REGLER
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. ALDRI bruk /v2/ prefix — base_url har allerede /v2. Bruk /employee, /customer osv.
-2. Bruk ID fra POST-respons direkte — ALDRI GET for å finne IDer du allerede har
-3. PUT er FULL-REPLACE i Tripletex — inkluder ALLTID alle felt i PUT-body
-4. Minimer antall API-kall (effektivitetsbonus ved perfekt korrekthet)
-5. Utfør kall i riktig rekkefølge (opprett avhengigheter først)
-6. Dagens dato: 2026-03-20
-7. Les 4xx-feilmeldinger nøye og korriger i neste kall
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## NAVNEPARSING
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"Fornavn Etternavn" → firstName="Fornavn", lastName="Etternavn"
-"Ole Martin Hansen" → firstName="Ole Martin", lastName="Hansen"
-ALDRI sett hele navnet i firstName alene. ALDRI la lastName stå tom.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## OPPGAVETYPER MED EKSEMPLER
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-### 1. OPPRETT ANSATT (uten administrator)
-POST /employee
-Body: {"firstName": "Kari", "lastName": "Nordmann", "email": "kari@example.org"}
-Valgfritt: phoneNumberMobile, employeeNumber (streng), dateOfBirth (YYYY-MM-DD)
-Svar: {"value": {"id": 123, ...}}
-
-### 2. OPPRETT ANSATT MED ADMINISTRATOR-ROLLE ⭐ (5/10 poeng!)
-Kall 1 – POST /employee:
-  {"firstName": "Kari", "lastName": "Nordmann", "email": "kari@example.org"}
-  → Hent id fra svar, f.eks. 123
-
-Kall 2 – PUT /employee/123 (inkluder ALLE felt + administrator):
-  {"id": 123, "firstName": "Kari", "lastName": "Nordmann", "email": "kari@example.org", "administrator": true}
-
-Trigger-ord: administrator, kontoadministrator, admin, account administrator, Kontoadministrator,
-  administrador, administrateur, Verwalter, administrador de conta
-
-### 3. OPPRETT KUNDE
-POST /customer
-Body: {"name": "Acme AS", "isCustomer": true, "email": "post@acme.no",
-       "organizationNumber": "123456789", "phoneNumber": "22334455"}
-Adresse: "physicalAddress": {"addressLine1": "Gateveien 1", "city": "Oslo",
-          "postalCode": "0150", "country": {"id": 1}}
-Svar: {"value": {"id": 456}}
-OBS: Land Norge = country.id = 1. isCustomer MÅ være true.
-
-### 4. OPPRETT LEVERANDØR
-POST /supplier
-Body: {"name": "Leverandør AS", "isSupplier": true, "email": "post@lev.no",
-       "organizationNumber": "987654321", "phoneNumber": "33445566"}
-Svar: {"value": {"id": ...}}
-OBS: isSupplier MÅ være true.
-
-### 5. OPPRETT PRODUKT
-POST /product
-Body: {"name": "Produkt X", "priceExcludingVatCurrency": 999.00,
-       "productNumber": "P001", "description": "Beskrivelse her"}
-Svar: {"value": {"id": 789}}
-
-### 6. OPPRETT ORDRE MED ORDRELINJER
-POST /order
-Body: {
-  "customer": {"id": KUNDE_ID},
-  "orderDate": "2026-03-20",
-  "orderLines": [
-    {"product": {"id": PRODUKT_ID}, "count": 2.0,
-     "unitPriceExcludingVatCurrency": 500.00, "description": "Varebeskrivelse"}
-  ]
-}
-Svar: {"value": {"id": 101}}
-OBS: Inkluder orderLines direkte i POST — sparer ett kall.
-
-### 7. OPPRETT FAKTURA (fra ordre)
-POST /invoice
-Body: {
-  "invoiceDate": "2026-03-20",
-  "invoiceDueDate": "2026-04-19",
-  "customer": {"id": KUNDE_ID},
-  "orders": [{"id": ORDRE_ID}]
-}
-Svar: {"value": {"id": 201}}
-OBS: Forfall = fakturadato + 30 dager hvis ikke spesifisert.
-OBS: orders er en liste med ordre-objekter.
-
-### 8. SEND FAKTURA
-PUT /invoice/201/:send
-Params: {"sendType": "EMAIL"}  ← eller EHF, EFAKTURA, AVTALEGIRO, VIPPS
-OBS: sendType sendes som query-parameter, ikke i body.
-
-### 9. REGISTRER BETALING PÅ FAKTURA
-POST /invoice/201/payment
-Body: {
-  "paymentDate": "2026-03-20",
-  "amount": 1000.00,
-  "paymentTypeId": 1
-}
-OBS: paymentTypeId 1 = bank. Bruk amount fra fakturaen.
-
-### 10. OPPRETT PROSJEKT
-POST /project
-Body: {
-  "name": "Prosjekt Alpha",
-  "number": "1001",
-  "startDate": "2026-03-20",
-  "endDate": "2026-12-31",
-  "customer": {"id": KUNDE_ID},
-  "projectManager": {"id": ANSATT_ID}
-}
-Svar: {"value": {"id": 301}}
-OBS: number er en STRENG (ikke tall). projectManager krever ansatt-id.
-
-### 11. OPPRETT AVDELING
-POST /department
-Body: {"name": "Salgsavdelingen", "departmentNumber": "10"}
-Valgfritt: "manager": {"id": ANSATT_ID}
-Svar: {"value": {"id": 401}}
-OBS: departmentNumber er en STRENG.
-
-### 12. OPPRETT REISEREGNING
-POST /travelExpense
-Body: {
-  "employee": {"id": ANSATT_ID},
-  "description": "Reise til Oslo",
-  "travelDetails": {
-    "departureDate": "2026-03-20",
-    "returnDate": "2026-03-21"
-  }
-}
-Svar: {"value": {"id": ...}}
-
-### 13. OPPRETT KONTAKTPERSON
-POST /contact
-Body: {"firstName": "Per", "lastName": "Hansen",
-       "customer": {"id": KUNDE_ID}, "email": "per@kunde.no"}
-Svar: {"value": {"id": ...}}
-
-### 14. SLETT ENTITET
-Finn først: GET /employee?firstName=X&lastName=Y&fields=id,firstName,lastName&count=5
-Slett: DELETE /employee/{id}
-OBS: Verifiser at du sletter riktig entitet ved å sjekke navn/data.
-
-### 15. OPPDATER EKSISTERENDE ENTITET
-Finn: GET /customer?name=X&fields=id,name,email&count=5
-Hent: GET /customer/{id}   ← for å se ALLE eksisterende felt
-Oppdater: PUT /customer/{id} med ALLE eksisterende felt + endringene
-OBS: PUT er full-replace — hent alle felt med GET /customer/{id} FØR du PUT-er!
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## SØK (kun når du ikke allerede har ID)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-GET /employee?firstName=X&lastName=Y&fields=id,firstName,lastName,email&count=10
-GET /customer?name=X&fields=id,name,email,organizationNumber&count=10
-GET /product?name=X&fields=id,name,priceExcludingVatCurrency&count=10
-GET /order?fields=id,orderDate&count=10
-Liste-format: {"fullResultSize": N, "values": [...]}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## FLERSPRÅKLIG ORDBOK
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-NORSK          | ENGELSK          | TYSK              | SPANSK           | FRANSK
-ansatt         | employee         | Mitarbeiter       | empleado         | employé
-kunde          | customer         | Kunde             | cliente          | client
-faktura        | invoice          | Rechnung          | factura          | facture
-ordre          | order            | Bestellung        | pedido           | commande
-produkt        | product          | Produkt           | producto         | produit
-prosjekt       | project          | Projekt           | proyecto         | projet
-avdeling       | department       | Abteilung         | departamento     | département
-leverandør     | supplier         | Lieferant         | proveedor        | fournisseur
-reiseregning   | travel expense   | Reisekostenabr.   | gasto de viaje   | note de frais
-kontaktperson  | contact          | Kontaktperson     | contacto         | contact
-administrator  | administrator    | Administrator     | administrador    | administrateur
-fornavn        | first name       | Vorname           | nombre           | prénom
-etternavn      | last name        | Nachname          | apellido         | nom de famille
-e-post         | email            | E-Mail            | correo           | e-mail
-telefon        | phone            | Telefon           | teléfono         | téléphone
-pris           | price            | Preis             | precio           | prix
-beskrivelse    | description      | Beschreibung      | descripción      | description
-opprett/lag    | create           | erstellen         | crear            | créer
-slett          | delete           | löschen           | eliminar         | supprimer
-oppdater       | update           | aktualisieren     | actualizar       | mettre à jour
-send           | send             | senden            | enviar           | envoyer
-betal/betaling | payment          | Zahlung           | pago             | paiement
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## FELTFORMAT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Datoer: YYYY-MM-DD
-- Pris: desimaltall (1500.00) — ingen valutasymbol
-- Nested ID: {"customer": {"id": 123}} — ikke customer_id: 123
-- Strenger: employeeNumber, productNumber, departmentNumber, project.number er STRENGER
-- PUT body: inkluder ALLTID "id"-feltet og alle andre felt (full-replace!)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-## FEILHÅNDTERING
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-422: Les validationMessages — forteller hvilket felt som mangler/er feil
-404: Sjekk endpoint-format (ikke /v2/employee, bare /employee)
-401: Autentiseringsfeil
-400: Les error.message for detaljer
-Ved feil: korriger og prøv én gang til med riktig data.
-"""
-
-# ---------------------------------------------------------------------------
-# TRIPLETEX API-KALL
+# HELPERS – TRIPLETEX API
 # ---------------------------------------------------------------------------
 
-def make_tripletex_call(
-    method: str,
-    endpoint: str,
-    base_url: str,
-    auth: tuple,
-    data: Optional[dict] = None,
-    params: Optional[dict] = None,
-) -> dict:
-    """Utfør ett API-kall mot Tripletex og returner responsen."""
-    # Sikre at endpoint ikke starter med /v2 (base_url har allerede /v2)
+def tx(method: str, endpoint: str, base_url: str, auth: tuple,
+       data: Optional[dict] = None, params: Optional[dict] = None) -> dict:
+    """Gjør ett Tripletex API-kall og returner JSON-svaret."""
     if endpoint.startswith("/v2/"):
         endpoint = endpoint[3:]
-
     url = base_url.rstrip("/") + endpoint
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    kwargs = {"auth": auth, "headers": headers, "timeout": 60}
+    if params:
+        kwargs["params"] = params
+    method = method.upper()
     try:
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        kwargs = {"auth": auth, "timeout": 60, "headers": headers}
-        if params:
-            kwargs["params"] = params
-
-        method = method.upper()
         if method == "GET":
             resp = requests.get(url, **kwargs)
         elif method == "POST":
@@ -257,28 +40,368 @@ def make_tripletex_call(
         elif method == "DELETE":
             resp = requests.delete(url, **kwargs)
         else:
-            return {"error": f"Ukjent metode: {method}"}
-
-        try:
-            result = resp.json()
-        except Exception:
-            result = {"status_code": resp.status_code, "text": resp.text[:500]}
-
-        if isinstance(result, dict):
-            result["_http_status"] = resp.status_code
-        else:
-            result = {"data": result, "_http_status": resp.status_code}
-
+            return {"error": "ukjent metode"}
         icon = "✓" if resp.status_code < 300 else "✗"
         print(f"  {icon} {method} {endpoint} → {resp.status_code}")
         if resp.status_code >= 400:
-            print(f"    Feil: {resp.text[:400]}")
+            print(f"    {resp.text[:300]}")
+        try:
+            return resp.json()
+        except Exception:
+            return {"status_code": resp.status_code, "text": resp.text[:200]}
+    except Exception as e:
+        print(f"  FEIL {method} {endpoint}: {e}")
+        return {"error": str(e)}
 
-        return result
+def val(result: dict) -> Optional[dict]:
+    """Hent value-objekt fra Tripletex-respons."""
+    return result.get("value") if isinstance(result, dict) else None
 
-    except Exception as exc:
-        print(f"  FEIL ved {method} {endpoint}: {exc}")
-        return {"error": str(exc)}
+def get_id(result: dict) -> Optional[int]:
+    v = val(result)
+    return v.get("id") if v else None
+
+# ---------------------------------------------------------------------------
+# HELPERS – REGEX-BASERT FELTUTHENTING
+# ---------------------------------------------------------------------------
+
+def extract_email(text: str) -> Optional[str]:
+    m = re.search(r'[\w.+-]+@[\w.-]+\.\w{2,}', text)
+    return m.group(0) if m else None
+
+def extract_phone(text: str) -> Optional[str]:
+    m = re.search(r'\b([\+]?[0-9]{8,12})\b', text)
+    return m.group(1) if m else None
+
+def extract_orgnr(text: str) -> Optional[str]:
+    m = re.search(r'\b(\d{9})\b', text)
+    return m.group(1) if m else None
+
+def extract_price(text: str) -> Optional[float]:
+    # Match tall med komma/punktum som desimalskilletegn
+    m = re.search(r'\b(\d{1,7}(?:[.,]\d{1,2})?)\s*(?:kr|krone|kroner|NOK|couronnes|coronas|Kronen)?\b', text, re.IGNORECASE)
+    if m:
+        return float(m.group(1).replace(',', '.'))
+    return None
+
+def extract_date(text: str) -> Optional[str]:
+    # ISO-format
+    m = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', text)
+    if m:
+        return m.group(1)
+    # DD.MM.YYYY
+    m = re.search(r'\b(\d{2})\.(\d{2})\.(\d{4})\b', text)
+    if m:
+        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    return "2026-03-20"
+
+def extract_number_str(text: str, label_patterns: list) -> Optional[str]:
+    """Finn et tall etter ett av label_patterns."""
+    for pat in label_patterns:
+        m = re.search(pat + r'[\s:]*(\d+)', text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+def extract_name(text: str) -> tuple:
+    """
+    Prøver å finne fornavn og etternavn fra teksten.
+    Returnerer (firstName, lastName) eller (None, None).
+    """
+    patterns = [
+        # "navn X Y", "name X Y", "named X Y", "namn X Y", "llamado X Y"
+        r'(?:navn|name|named|namn|llamado|appelé|namens|tilsett)\s+([A-ZÆØÅ][a-zæøåé]+(?:\s[A-ZÆØÅ][a-zæøåé]+)*)',
+        # "ansatt/employee/Mitarbeiter X Y"
+        r'(?:ansatt|employee|Mitarbeiter|empleado|employé)\s+(?:med navn\s+)?([A-ZÆØÅ][a-zæøåé]+(?:\s[A-ZÆØÅ][a-zæøåé]+)*)',
+        # "med navn X Y"
+        r'med\s+navn\s+([A-ZÆØÅ][a-zæøåé]+(?:\s[A-ZÆØÅ][a-zæøåé]+)*)',
+        # Fallback: to store bokstaver i teksten
+        r'\b([A-ZÆØÅ][a-zæøåé]+)\s+([A-ZÆØÅ][a-zæøåé]+)\b',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            full = m.group(1).strip()
+            parts = full.split()
+            if len(parts) >= 2:
+                return " ".join(parts[:-1]), parts[-1]
+            elif len(parts) == 1:
+                # Prøv neste match
+                continue
+    return None, None
+
+def extract_company_name(text: str) -> Optional[str]:
+    """Finn firmanavn (typisk inneholder AS, ASA, Ltd osv.)"""
+    patterns = [
+        r'(?:kunde|customer|leverandør|supplier|klient|client|Kunde|Lieferant|fournisseur|proveedor)\s+(?:med navn\s+)?["\']?([A-ZÆØÅ][^,\n"\']{2,50}?(?:AS|ASA|Ltd|GmbH|AB|BV|SRL|Inc)?)["\']?(?:\s*,|\s+med|\s+og|\s*$)',
+        r'(?:kalt|called|heißt|llamado|appelé|namens)\s+["\']?([A-ZÆØÅ][^,\n"\']{2,50})["\']?',
+        r'["\']([A-ZÆØÅ][^"\']{3,50}(?:AS|ASA|Ltd|GmbH)?)["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+def extract_product_name(text: str) -> Optional[str]:
+    patterns = [
+        r'(?:produkt|product|Produkt|produit|producto)\s+(?:med navn\s+)?["\']?([A-ZÆØÅa-zæøå][^,\n"\']{2,60})["\']?(?:\s*,|\s+med|\s+pris|\s+og|\s*$)',
+        r'(?:kalt|called|appelé|llamado|namens)\s+["\']?([^,\n"\']{3,60})["\']?',
+        r'["\']([^"\']{3,60})["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+def extract_department_name(text: str) -> Optional[str]:
+    patterns = [
+        r'(?:avdeling|department|Abteilung|département|departamento)\s+(?:med navn\s+)?["\']?([A-ZÆØÅa-zæøå][^,\n"\']{2,60})["\']?(?:\s*,|\s+med|\s+nummer|\s*$)',
+        r'(?:kalt|called|namens|appelée?|llamad[ao])\s+["\']?([^,\n"\']{3,60})["\']?',
+        r'["\']([^"\']{3,60})["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+def is_admin_task(text: str) -> bool:
+    keywords = ["administrator", "kontoadministrator", "admin",
+                 "administrador", "administrateur", "verwalter",
+                 "account administrator", "konto administrator"]
+    return any(k in text.lower() for k in keywords)
+
+def detect_task_type(text: str) -> str:
+    t = text.lower()
+    # Sjekk i prioritert rekkefølge
+    if any(k in t for k in ["reiseregning", "travel expense", "reisekostenabr", "gasto de viaje", "note de frais"]):
+        return "travelExpense"
+    if any(k in t for k in ["faktura", "invoice", "rechnung", "factura", "facture"]):
+        return "invoice"
+    if any(k in t for k in ["ordre", "order", "bestellung", "pedido", "commande"]):
+        return "order"
+    if any(k in t for k in ["prosjekt", "project", "projekt", "proyecto", "projet"]):
+        return "project"
+    if any(k in t for k in ["avdeling", "department", "abteilung", "département", "departamento"]):
+        return "department"
+    if any(k in t for k in ["leverandør", "supplier", "lieferant", "proveedor", "fournisseur"]):
+        return "supplier"
+    if any(k in t for k in ["produkt", "product", "producto", "produit"]):
+        return "product"
+    if any(k in t for k in ["kunde", "customer", "klient", "client", "kunde"]):
+        return "customer"
+    if any(k in t for k in ["ansatt", "employee", "medarbeider", "mitarbeiter", "empleado", "employé", "tilsett", "tilsatt"]):
+        return "employee"
+    # Fallback: se etter navn/epost = trolig ansatt
+    if extract_email(text):
+        return "employee"
+    return "unknown"
+
+# ---------------------------------------------------------------------------
+# OPPGAVEHANDLERE
+# ---------------------------------------------------------------------------
+
+def handle_employee(prompt: str, base_url: str, auth: tuple):
+    first, last = extract_name(prompt)
+    email = extract_email(prompt)
+    phone = extract_phone(prompt)
+
+    if not first or not last:
+        print("  Kunne ikke parse navn fra prompt")
+        return
+
+    body = {"firstName": first, "lastName": last}
+    if email:
+        body["email"] = email
+    if phone:
+        body["phoneNumberMobile"] = phone
+
+    result = tx("POST", "/employee", base_url, auth, body)
+    emp_id = get_id(result)
+    print(f"  Ansatt opprettet: id={emp_id}, {first} {last}")
+
+    if emp_id and is_admin_task(prompt):
+        admin_body = {"id": emp_id, "firstName": first, "lastName": last, "administrator": True}
+        if email:
+            admin_body["email"] = email
+        if phone:
+            admin_body["phoneNumberMobile"] = phone
+        tx("PUT", f"/employee/{emp_id}", base_url, auth, admin_body)
+        print(f"  Administrator-rolle satt for {first} {last}")
+
+
+def handle_customer(prompt: str, base_url: str, auth: tuple):
+    name = extract_company_name(prompt)
+    if not name:
+        # Fallback: bruk personnavn
+        first, last = extract_name(prompt)
+        name = f"{first} {last}" if first else "Ukjent Kunde AS"
+
+    email = extract_email(prompt)
+    phone = extract_phone(prompt)
+    orgnr = extract_orgnr(prompt)
+
+    body = {"name": name, "isCustomer": True}
+    if email:
+        body["email"] = email
+    if phone:
+        body["phoneNumber"] = phone
+    if orgnr:
+        body["organizationNumber"] = orgnr
+
+    # Adresse
+    city_m = re.search(r'\b(Oslo|Bergen|Trondheim|Stavanger|Tromsø|Kristiansand|Drammen|Fredrikstad|Sandnes|Bodø)\b', prompt, re.IGNORECASE)
+    street_m = re.search(r'(?:adresse|address|Adresse)\s+([A-ZÆØÅ][^,\n]{3,40})', prompt, re.IGNORECASE)
+    postal_m = re.search(r'\b(\d{4})\b', prompt)
+
+    if city_m or street_m:
+        addr = {"country": {"id": 1}}
+        if street_m:
+            addr["addressLine1"] = street_m.group(1).strip()
+        if city_m:
+            addr["city"] = city_m.group(1)
+        if postal_m:
+            addr["postalCode"] = postal_m.group(1)
+        body["physicalAddress"] = addr
+
+    result = tx("POST", "/customer", base_url, auth, body)
+    print(f"  Kunde opprettet: id={get_id(result)}, {name}")
+
+
+def handle_supplier(prompt: str, base_url: str, auth: tuple):
+    name = extract_company_name(prompt)
+    if not name:
+        first, last = extract_name(prompt)
+        name = f"{first} {last}" if first else "Ukjent Leverandør AS"
+
+    email = extract_email(prompt)
+    phone = extract_phone(prompt)
+    orgnr = extract_orgnr(prompt)
+
+    body = {"name": name, "isSupplier": True}
+    if email:
+        body["email"] = email
+    if phone:
+        body["phoneNumber"] = phone
+    if orgnr:
+        body["organizationNumber"] = orgnr
+
+    result = tx("POST", "/supplier", base_url, auth, body)
+    print(f"  Leverandør opprettet: id={get_id(result)}, {name}")
+
+
+def handle_product(prompt: str, base_url: str, auth: tuple):
+    name = extract_product_name(prompt)
+    if not name:
+        name = "Produkt"
+
+    price = extract_price(prompt)
+    prodnr_m = re.search(r'(?:produktnummer|product.?number|Produktnummer|numéro)[:\s]+([A-Za-z0-9-]+)', prompt, re.IGNORECASE)
+    if not prodnr_m:
+        prodnr_m = re.search(r'\b(P\d{2,6})\b', prompt)
+
+    body = {"name": name}
+    if price:
+        body["priceExcludingVatCurrency"] = price
+    if prodnr_m:
+        body["productNumber"] = prodnr_m.group(1)
+
+    desc_m = re.search(r'(?:beskrivelse|description|Beschreibung|descripción)[:\s]+([^,\n]{3,100})', prompt, re.IGNORECASE)
+    if desc_m:
+        body["description"] = desc_m.group(1).strip()
+
+    result = tx("POST", "/product", base_url, auth, body)
+    print(f"  Produkt opprettet: id={get_id(result)}, {name}")
+
+
+def handle_department(prompt: str, base_url: str, auth: tuple):
+    name = extract_department_name(prompt)
+    if not name:
+        name = "Ny avdeling"
+
+    deptnr = extract_number_str(prompt, [
+        r'avdelingsnummer', r'department.?number', r'Abteilungsnummer',
+        r'numéro', r'número', r'nummer'
+    ])
+    if not deptnr:
+        deptnr = str(random.randint(10, 99))
+
+    body = {"name": name, "departmentNumber": deptnr}
+    result = tx("POST", "/department", base_url, auth, body)
+    print(f"  Avdeling opprettet: id={get_id(result)}, {name}")
+
+
+def handle_project(prompt: str, base_url: str, auth: tuple):
+    # Finn prosjektnavn
+    name_m = re.search(r'(?:prosjekt|project|Projekt|projet|proyecto)\s+(?:kalt\s+|named\s+|appelé\s+)?["\']?([A-ZÆØÅa-zæøå][^,\n"\']{2,60})["\']?', prompt, re.IGNORECASE)
+    name = name_m.group(1).strip() if name_m else "Nytt prosjekt"
+
+    date = extract_date(prompt)
+    end_m = re.search(r'(?:sluttdato|end.?date|Enddatum)[:\s]+(\d{4}-\d{2}-\d{2})', prompt, re.IGNORECASE)
+
+    projnr = extract_number_str(prompt, [r'prosjektnummer', r'project.?number', r'nummer'])
+    if not projnr:
+        projnr = str(random.randint(1000, 9999))
+
+    # Trenger kunde — søk etter eksisterende eller opprett dummy
+    cust_result = tx("GET", "/customer", base_url, auth, params={"count": 1, "fields": "id,name"})
+    cust_values = cust_result.get("values", []) if isinstance(cust_result, dict) else []
+    if cust_values:
+        cust_id = cust_values[0]["id"]
+    else:
+        # Opprett en dummy-kunde
+        c = tx("POST", "/customer", base_url, auth, {"name": "Prosjektkunde AS", "isCustomer": True})
+        cust_id = get_id(c) or 0
+
+    body = {
+        "name": name,
+        "number": projnr,
+        "startDate": date,
+        "customer": {"id": cust_id}
+    }
+    if end_m:
+        body["endDate"] = end_m.group(1)
+
+    result = tx("POST", "/project", base_url, auth, body)
+    print(f"  Prosjekt opprettet: id={get_id(result)}, {name}")
+
+
+def handle_travel_expense(prompt: str, base_url: str, auth: tuple):
+    date = extract_date(prompt)
+    desc_m = re.search(r'(?:beskrivelse|description|Beschreibung|descripción)[:\s]+([^,\n]{3,100})', prompt, re.IGNORECASE)
+    desc = desc_m.group(1).strip() if desc_m else "Reise"
+
+    # Finn eller opprett ansatt
+    first, last = extract_name(prompt)
+    emp_id = None
+
+    if first and last:
+        search = tx("GET", "/employee", base_url, auth,
+                    params={"firstName": first, "lastName": last, "fields": "id,firstName,lastName", "count": 5})
+        vals = search.get("values", []) if isinstance(search, dict) else []
+        if vals:
+            emp_id = vals[0]["id"]
+
+    if not emp_id:
+        # Hent første ansatt
+        search = tx("GET", "/employee", base_url, auth, params={"fields": "id,firstName", "count": 1})
+        vals = search.get("values", []) if isinstance(search, dict) else []
+        if vals:
+            emp_id = vals[0]["id"]
+
+    if not emp_id:
+        print("  Ingen ansatt funnet for reiseregning")
+        return
+
+    body = {
+        "employee": {"id": emp_id},
+        "description": desc,
+        "travelDetails": {"departureDate": date}
+    }
+    result = tx("POST", "/travelExpense", base_url, auth, body)
+    print(f"  Reiseregning opprettet: id={get_id(result)}")
 
 
 # ---------------------------------------------------------------------------
@@ -303,156 +426,34 @@ def solve():
         auth = ("0", session_token)
 
         print(f"\n=== NY OPPGAVE ===\nPrompt: {prompt[:200]}")
-        print(f"Base URL: {base_url}")
 
-        # ---- Bygg brukermelding ----
-        user_content = []
-
-        # Legg til vedlagte filer
+        # Håndter vedlagte filer
         for f in files:
-            fname = f.get("filename", "fil")
-            mime = f.get("mime_type", "application/octet-stream")
-            b64 = f.get("content_base64", "")
             try:
-                if mime.startswith("image/"):
-                    user_content.append({
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": mime, "data": b64},
-                    })
-                elif mime == "application/pdf":
-                    user_content.append({
-                        "type": "document",
-                        "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
-                    })
-                else:
-                    text = base64.b64decode(b64).decode("utf-8", errors="replace")
-                    user_content.append({"type": "text", "text": f"[Fil: {fname}]\n{text}"})
+                data = base64.b64decode(f.get("content_base64", ""))
+                Path(f["filename"]).write_bytes(data)
             except Exception:
-                user_content.append({"type": "text", "text": f"[Fil: {fname} – kunne ikke leses]"})
+                pass
 
-        # Detekter oppgavetype for å gi ekstra hint
-        prompt_lower = prompt.lower()
-        hints = []
+        task = detect_task_type(prompt)
+        print(f"  Oppgavetype: {task}")
 
-        admin_words = ["administrator", "kontoadministrator", "admin",
-                       "administrador", "administrateur", "verwalter"]
-        if any(w in prompt_lower for w in admin_words):
-            hints.append(
-                "⭐ ADMINISTRATOR-OPPGAVE: Gjør KUN to kall:\n"
-                "1. POST /employee med firstName, lastName, email\n"
-                "2. PUT /employee/{id} med ALLE felt + \"administrator\": true\n"
-                "PUT-body EKSEMPEL: {\"id\": 123, \"firstName\": \"Kari\", "
-                "\"lastName\": \"Nordmann\", \"email\": \"kari@example.org\", \"administrator\": true}"
-            )
-
-        delete_words = ["slett", "delete", "fjern", "löschen", "eliminar", "supprimer"]
-        if any(w in prompt_lower for w in delete_words):
-            hints.append(
-                "SLETT-OPPGAVE: Finn entiteten med GET (søk på navn), "
-                "verifiser at det er riktig, deretter DELETE /{entity}/{id}"
-            )
-
-        update_words = ["oppdater", "endre", "update", "aktualisier", "actualiz", "mettre à jour"]
-        if any(w in prompt_lower for w in update_words):
-            hints.append(
-                "OPPDATER-OPPGAVE: 1) Finn entiteten med GET, "
-                "2) Hent full detalj med GET /{entity}/{id}, "
-                "3) PUT med ALLE eksisterende felt + endringene (full-replace!)"
-            )
-
-        hint_text = ("\n\n" + "\n\n".join(hints)) if hints else ""
-
-        user_content.append({
-            "type": "text",
-            "text": (
-                f"Oppgave: {prompt}\n\n"
-                f"Tripletex base URL: {base_url}"
-                f"{hint_text}\n\n"
-                "Utfør ALLE steg. Les hvert API-svar nøye. "
-                "Navneparsing: 'Kari Nordmann' → firstName='Kari', lastName='Nordmann'. "
-                "Endepunkter: /employee, /customer osv – IKKE /v2/employee."
-            ),
-        })
-
-        # ---- Tool-definisjon ----
-        tools = [
-            {
-                "name": "tripletex_api",
-                "description": (
-                    "Kall Tripletex v2 REST API. "
-                    "Endepunkter: /employee, /customer osv (IKKE /v2/employee). "
-                    "PUT er full-replace — inkluder alltid alle felt + id i body."
-                ),
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "method": {
-                            "type": "string",
-                            "enum": ["GET", "POST", "PUT", "DELETE"],
-                            "description": "HTTP-metode",
-                        },
-                        "endpoint": {
-                            "type": "string",
-                            "description": "Endepunkt uten /v2, f.eks. /employee, /customer/123, /invoice/456/:send",
-                        },
-                        "data": {
-                            "type": "object",
-                            "description": "Request-body for POST/PUT",
-                        },
-                        "params": {
-                            "type": "object",
-                            "description": "Query-parametere, f.eks. {\"sendType\": \"EMAIL\", \"fields\": \"id,name\"}",
-                        },
-                    },
-                    "required": ["method", "endpoint"],
-                },
-            }
-        ]
-
-        # ---- Agentisk løkke ----
-        client = anthropic.Anthropic()
-        messages = [{"role": "user", "content": user_content}]
-        max_iterations = 30
-
-        for iteration in range(max_iterations):
-            response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=8096,
-                system=SYSTEM_PROMPT,
-                tools=tools,
-                messages=messages,
-            )
-
-            print(f"  Iterasjon {iteration + 1}: stop_reason={response.stop_reason}")
-            messages.append({"role": "assistant", "content": response.content})
-
-            if response.stop_reason == "end_turn":
-                print("  Claude ferdig.")
-                break
-
-            if response.stop_reason == "tool_use":
-                tool_results = []
-                for block in response.content:
-                    if block.type != "tool_use":
-                        continue
-                    inp = block.input
-                    print(f"  → {inp.get('method')} {inp.get('endpoint')}")
-                    api_result = make_tripletex_call(
-                        method=inp.get("method", "GET"),
-                        endpoint=inp.get("endpoint", ""),
-                        base_url=base_url,
-                        auth=auth,
-                        data=inp.get("data"),
-                        params=inp.get("params"),
-                    )
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": json.dumps(api_result, ensure_ascii=False),
-                    })
-                messages.append({"role": "user", "content": tool_results})
-            else:
-                break
+        if task == "employee":
+            handle_employee(prompt, base_url, auth)
+        elif task == "customer":
+            handle_customer(prompt, base_url, auth)
+        elif task == "supplier":
+            handle_supplier(prompt, base_url, auth)
+        elif task == "product":
+            handle_product(prompt, base_url, auth)
+        elif task == "department":
+            handle_department(prompt, base_url, auth)
+        elif task == "project":
+            handle_project(prompt, base_url, auth)
+        elif task == "travelExpense":
+            handle_travel_expense(prompt, base_url, auth)
+        else:
+            print(f"  Ukjent oppgavetype for: {prompt[:100]}")
 
     except Exception as exc:
         import traceback

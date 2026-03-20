@@ -11,7 +11,7 @@ import requests
 # ---------------------------------------------------------------------------
 # KONFIGURASJON
 # ---------------------------------------------------------------------------
-AGENT_URL = "https://tripletex-agent.onrender.com/solve"  # Bytt til http://localhost:8000/solve for lokal test
+AGENT_URL = "http://localhost:8000/solve"  # Bytt til https://tripletex-agent.onrender.com/solve for prod
 SANDBOX_TOKEN = "eyJ0b2tlbklkIjoyMTQ3NjMyNzMzLCJ0b2tlbiI6IjZmNzMxNzI3LWI4YzAtNDUwNS04NDYyLTdiMjZhNjY5ZWJjOCJ9"
 SANDBOX_BASE_URL = "https://kkpqfuj-amager.tripletex.dev/v2"
 
