@@ -223,13 +223,11 @@ def handle_employee(prompt: str, base_url: str, auth: tuple):
     print(f"  Ansatt opprettet: id={emp_id}, {first} {last}")
 
     if emp_id and is_admin_task(prompt):
-        admin_body = {"id": emp_id, "firstName": first, "lastName": last, "administrator": True}
-        if email:
-            admin_body["email"] = email
-        if phone:
-            admin_body["phoneNumberMobile"] = phone
-        tx("PUT", f"/employee/{emp_id}", base_url, auth, admin_body)
-        print(f"  Administrator-rolle satt for {first} {last}")
+        # Korrekt måte å sette administrator i Tripletex:
+        # PUT /employee/entitlement/:grantEntitlementsByTemplate?employeeId=X&template=ALL_PRIVILEGES
+        tx("PUT", "/employee/entitlement/:grantEntitlementsByTemplate",
+           base_url, auth, params={"employeeId": emp_id, "template": "ALL_PRIVILEGES"})
+        print(f"  Administrator-rolle (ALL_PRIVILEGES) satt for {first} {last}")
 
 
 def handle_customer(prompt: str, base_url: str, auth: tuple):
