@@ -353,7 +353,7 @@ def solve():
 
         for iteration in range(max_iterations):
             response = client.messages.create(
-                model="claude-opus-4-5",
+                model="claude-sonnet-4-6",
                 max_tokens=8096,
                 system=SYSTEM_PROMPT,
                 tools=tools,
