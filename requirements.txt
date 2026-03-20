@@ -2,4 +2,4 @@ fastapi
 uvicorn[standard]
 flask>=3.0.0
 requests
-anthropic
+google-generativeai
